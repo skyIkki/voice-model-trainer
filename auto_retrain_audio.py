@@ -7,7 +7,7 @@ from torchvision import models
 import firebase_admin
 from firebase_admin import credentials, storage
 
-#  CONFIG
+# --- CONFIGURATION ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_FILE = "best_voice_model.pt"
 LABEL_FILE = "class_to_label.json"
@@ -19,17 +19,23 @@ MODEL_PREFIX = ""
 BATCH_SIZE, LR, EPOCHS = 32, 0.001, 15
 VAL_RATIO = 0.2
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
-def set_seed(s=42): random.seed(s); torch.manual_seed(s); torchaudio.set_audio_backend("sox_io")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+def set_seed(s=42):
+    random.seed(s)
+    torch.manual_seed(s)
+    torchaudio.set_audio_backend("sox_io")
 set_seed()
 
+# --- FIREBASE INITIALIZATION ---
 def init_firebase():
     key = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
-    if not key: raise Exception("Missing FIREBASE_SERVICE_ACCOUNT_KEY")
+    if not key:
+        raise Exception("Missing FIREBASE_SERVICE_ACCOUNT_KEY")
     cred = credentials.Certificate(json.loads(base64.b64decode(key)))
     firebase_admin.initialize_app(cred, {'storageBucket': BUCKET})
     logging.info("✅ Firebase initialized")
 
+# --- DOWNLOAD USER AUDIO ---
 def download_user_audio():
     os.makedirs(USER_DIR, exist_ok=True)
     bucket = storage.bucket()
@@ -41,6 +47,7 @@ def download_user_audio():
         blob.download_to_filename(target)
         logging.debug(f"🎧 {blob.name} → {target}")
 
+# --- AUDIO DATASET ---
 class AudioDataset(Dataset):
     def __init__(self, root):
         self.samples, self.labels = [], {}
@@ -52,9 +59,10 @@ class AudioDataset(Dataset):
                 for f in os.listdir(path):
                     if f.lower().endswith(".wav"):
                         self.samples.append((os.path.join(path, f), idx))
-        logging.info(f"Loaded {len(self.samples)} samples from {root}")
+        logging.info(f"📂 Loaded {len(self.samples)} samples from {root}")
 
     def __len__(self): return len(self.samples)
+
     def __getitem__(self, i):
         path, label = self.samples[i]
         wav, sr = torchaudio.load(path)
@@ -66,6 +74,7 @@ class AudioDataset(Dataset):
         spec = spec[:, :, :128]
         return spec, label
 
+# --- PREPARE DATA ---
 def prepare_data():
     datasets = []
     for d in [BASE_DIR, USER_DIR]:
@@ -75,33 +84,82 @@ def prepare_data():
     n = len(full); v = int(n * VAL_RATIO); t = n - v
     return random_split(full, [t, v])
 
+# --- MODEL ---
 def build_model(num_classes):
     m = models.resnet18(weights=None)
     m.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     m.fc = nn.Linear(m.fc.in_features, num_classes)
     return m.to(DEVICE)
 
+# --- TRAIN AND SAVE ---
 def train_and_save():
     train_ds, val_ds = prepare_data()
     num_classes = len({y for _, y in train_ds})
     model = build_model(num_classes)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     crit = nn.CrossEntropyLoss()
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+
+    best_loss = float("inf")
+
     for epoch in range(EPOCHS):
         model.train()
-        # -(Add training loop here)-
-    # -(After training)-
+        total_loss, correct, total = 0, 0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            out = model(xb)
+            loss = crit(out, yb)
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+            preds = out.argmax(dim=1)
+            correct += (preds == yb).sum().item()
+            total += yb.size(0)
+
+        avg_loss = total_loss / len(train_loader)
+        acc = 100 * correct / total
+        logging.info(f"📦 Epoch {epoch+1}/{EPOCHS} - Loss: {avg_loss:.4f} - Acc: {acc:.2f}%")
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                out = model(xb)
+                loss = crit(out, yb)
+                val_loss += loss.item()
+        val_loss /= len(val_loader)
+        logging.info(f"🔍 Val Loss: {val_loss:.4f}")
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(model.state_dict(), "best_weights.pth")
+            logging.info("✅ Best model updated")
+
+    # Load best weights before export
+    if os.path.exists("best_weights.pth"):
+        model.load_state_dict(torch.load("best_weights.pth"))
+
+    # Export TorchScript
     torch.jit.script(model.cpu()).save(MODEL_FILE)
-    # Save class->label map
+    logging.info(f"🧠 Model saved as {MODEL_FILE}")
+
+    # Save class mapping
     cls_map = {i: name for name, i in train_ds.dataset.datasets[0].labels.items()}
     with open(LABEL_FILE, "w") as f: json.dump(cls_map, f)
-    # Upload model + mapping + version
+    logging.info(f"📄 Label mapping saved as {LABEL_FILE}")
+
+    # Upload to Firebase
     bucket = storage.bucket()
     for fname in [MODEL_FILE, LABEL_FILE]:
         blob = bucket.blob(os.path.join(MODEL_PREFIX, fname))
         blob.upload_from_filename(fname)
-    logging.info("🏁 Model and mapping uploaded")
+        logging.info(f"☁️ Uploaded {fname} to Firebase")
 
+# --- MAIN ---
 if __name__ == "__main__":
     init_firebase()
     download_user_audio()
