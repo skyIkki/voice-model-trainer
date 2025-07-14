@@ -1,6 +1,4 @@
-firebase-admin
 torch
 torchaudio
-librosa
-numpy
-scikit-learn
+firebase-admin
+google-cloud-storage
