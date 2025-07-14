@@ -2,3 +2,7 @@ torch
 torchaudio
 firebase-admin
 google-cloud-storage
+librosa
+numpy
+scikit-learn
+soundfile
