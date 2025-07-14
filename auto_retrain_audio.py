@@ -34,7 +34,7 @@ def init_firebase():
     json_key = json.loads(base64.b64decode(key))
     cred = credentials.Certificate(json_key)
     firebase_admin.initialize_app(cred, {
-        "storageBucket": "voice-model-trainer-b6814.appspot.com"
+        "storageBucket": "voice-model-trainer-b6814.firebasestorage.app"
     })
 
 # --- DOWNLOAD USER AUDIO ---
