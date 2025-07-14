@@ -34,7 +34,7 @@ def init_firebase():
     json_key = json.loads(base64.b64decode(key))
     cred = credentials.Certificate(json_key)
     firebase_admin.initialize_app(cred, {
-        "storageBucket": "voice-model-trainer-b6814.firebasestorage.app"
+        "storageBucket": "voice-model-trainer-b6814.appspot.com"
     })
 
 # --- DOWNLOAD USER AUDIO ---
@@ -74,9 +74,8 @@ class AudioDataset(Dataset):
         spec = torchaudio.transforms.AmplitudeToDB()(spec)
         if spec.shape[-1] < 128:
             spec = torch.nn.functional.pad(spec, (0, 128 - spec.shape[-1]))
-        spec = spec[:, :, :128]
+        spec = spec[:, :, :128]  # [1, 128, 128]
         return spec, label
-
 
 # --- PREPARE DATA ---
 def prepare_data():
@@ -91,14 +90,12 @@ def prepare_data():
     t = n - v
     return random_split(full, [t, v])
 
-
 # --- MODEL ---
 def build_model(num_classes):
     m = models.resnet18(weights=None)
     m.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     m.fc = nn.Linear(m.fc.in_features, num_classes)
     return m.to(DEVICE)
-
 
 # --- WRAPPER FOR EXPORT ---
 class VoiceWrapper(nn.Module):
@@ -110,15 +107,15 @@ class VoiceWrapper(nn.Module):
 
     def forward(self, wav):  # wav: shape [1, num_samples]
         if wav.dim() == 2 and wav.size(0) == 1:
-            spec = self.melspec(wav)
+            spec = self.melspec(wav)           # [1, 128, time]
             spec = self.db(spec)
             if spec.shape[-1] < 128:
                 spec = torch.nn.functional.pad(spec, (0, 128 - spec.shape[-1]))
-            spec = spec[:, :, :128]
+            spec = spec[:, :, :128]            # [1, 128, 128]
+            spec = spec.unsqueeze(0)           # ✅ [1, 1, 128, 128]
             return self.model(spec)
         else:
             raise ValueError("Expected input shape [1, num_samples]")
-
 
 # --- TRAIN AND SAVE ---
 def train_and_save():
@@ -189,7 +186,6 @@ def train_and_save():
         blob = bucket.blob(os.path.join(MODEL_PREFIX, fname))
         blob.upload_from_filename(fname)
         logging.info(f"☁️ Uploaded {fname} to Firebase")
-
 
 # --- MAIN ---
 if __name__ == "__main__":
