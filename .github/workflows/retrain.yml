@@ -1,28 +1,41 @@
 name: 🎙️ Retrain Voice Model
+
 on:
   push:
     branches: [ main ]
-    paths: [ 'auto_retrain_audio.py', 'requirements.txt' ]
+    paths: 
+      - 'auto_retrain_audio.py'
+      - 'requirements.txt'
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *'  # Runs daily at midnight UTC
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   train:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-      - run: pip install -r requirements.txt
-      - name: Run retraining
-        env:
-          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
-        run: python auto_retrain_audio.py
-      - run: |
-          rm -rf voice_training_data
-          rm -f best_voice_model.pt class_to_label.json model_version.txt
-      - run: echo "✅ Training run complete"
+    - name: 📥 Checkout repository
+      uses: actions/checkout@v4
+
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: 📦 Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: 🧠 Run retraining script
+      env:
+        FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+      run: python auto_retrain_audio.py
+
+    - name: 🧹 Cleanup artifacts
+      run: |
+        rm -rf voice_training_data
+        rm -f best_voice_model.pt class_to_label.json best_weights.pth
+
+    - name: ✅ Done
+      run: echo "✅ Voice model retraining complete!"
