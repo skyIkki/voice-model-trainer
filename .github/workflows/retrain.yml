@@ -1,0 +1,28 @@
+name: 🎙️ Retrain Voice Model
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'auto_retrain_audio.py', 'requirements.txt' ]
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Run retraining
+        env:
+          FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+        run: python auto_retrain_audio.py
+      - run: |
+          rm -rf voice_training_data
+          rm -f best_voice_model.pt class_to_label.json model_version.txt
+      - run: echo "✅ Training run complete"
