@@ -13,17 +13,17 @@ MODEL_FILE = "best_voice_model.pt"
 LABEL_FILE = "class_to_label.json"
 USER_DIR = "voice_training_data"
 BASE_DIR = "base_training_data"
-BUCKET = "flower-identification-c2ef6.firebasestorage.app"
 USER_PREFIX = "user_training_data/"
 MODEL_PREFIX = ""
 BATCH_SIZE, LR, EPOCHS = 32, 0.001, 15
 VAL_RATIO = 0.2
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
 def set_seed(s=42):
     random.seed(s)
     torch.manual_seed(s)
-    torchaudio.set_audio_backend("sox_io")
+
 set_seed()
 
 # --- FIREBASE INITIALIZATION ---
