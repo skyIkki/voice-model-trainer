@@ -29,11 +29,11 @@ set_seed()
 # --- FIREBASE INITIALIZATION ---
 def init_firebase():
     key = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
-    if not key:
-        raise Exception("Missing FIREBASE_SERVICE_ACCOUNT_KEY")
-    cred = credentials.Certificate(json.loads(base64.b64decode(key)))
-    firebase_admin.initialize_app(cred, {'storageBucket': BUCKET})
-    logging.info("✅ Firebase initialized")
+    json_key = json.loads(base64.b64decode(key))
+    cred = credentials.Certificate(json_key)
+    firebase_admin.initialize_app(cred, {
+        "storageBucket": "voice-model-trainer-b6814.appspot.com"
+    })
 
 # --- DOWNLOAD USER AUDIO ---
 def download_user_audio():
