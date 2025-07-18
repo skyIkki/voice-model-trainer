@@ -13,10 +13,8 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
-    # --- NEW: Add environment variable for GitHub Token ---
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    # --- END NEW ---
 
     steps:
     - name: 📥 Checkout repository
@@ -25,7 +23,7 @@ jobs:
     - name: 🐍 Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.11' # CHANGED FROM '3.10' TO '3.11'
         cache: 'pip'
 
     - name: 📦 Install dependencies
@@ -39,7 +37,7 @@ jobs:
 
     - name: 🧹 Cleanup artifacts
       run: |
-        rm -rf user_training_data # Corrected directory name based on your script
+        rm -rf user_training_data
         rm -f best_voice_model.pt class_to_label.json firebase_key.json
 
     - name: ✅ Done
