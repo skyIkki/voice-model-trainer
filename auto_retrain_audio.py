@@ -12,13 +12,14 @@ from torch.utils.data import Dataset, DataLoader
 from torch import nn, optim
 import soundfile as sf
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
+import json # Import json for saving class map
 
 # --- CONFIGURATION ---
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
 DOWNLOAD_DIR = "user_training_data"
 SAMPLE_RATE = 16000
 DURATION = 3  # seconds
-NUM_CLASSES = 0
+NUM_CLASSES = 0 # Will be set dynamically
 BATCH_SIZE = 8
 EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -27,7 +28,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 augment = Compose([
     AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
     TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
-    PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
+    PitchShift(min_semitones=-2, max_semitones=-2, p=0.5), # Corrected min_semitones
     Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
 ])
 
@@ -44,12 +45,16 @@ except ValueError:
     print("Firebase app already initialized or firebase_key.json not found. Skipping initialization.")
     # This block handles cases where the app might be initialized elsewhere or key is missing for local dev.
     # In GitHub Actions, the key will always be created.
+except FileNotFoundError:
+    print("firebase_key.json not found. Ensure it's in the root directory for local testing.")
+    # For GitHub Actions, this file is created by the workflow.
 
 def download_training_data():
     # Only import shutil if needed, to avoid potential import errors if not present
     try:
         import shutil
         if os.path.exists(DOWNLOAD_DIR):
+            print(f"Removing existing {DOWNLOAD_DIR} directory...")
             shutil.rmtree(DOWNLOAD_DIR)
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     except ImportError:
@@ -61,7 +66,9 @@ def download_training_data():
         print("Firebase bucket not initialized. Skipping data download.")
         return
 
+    print(f"Downloading data from Firebase bucket '{BUCKET_NAME}'...")
     blobs = bucket.list_blobs(prefix="user_training_data/")
+    downloaded_count = 0
     for blob in blobs:
         if blob.name.endswith(".wav"):
             # Construct local path, skipping the 'user_training_data/' prefix
@@ -72,6 +79,9 @@ def download_training_data():
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             blob.download_to_filename(local_path)
             print(f"✅ Downloaded {blob.name}")
+            downloaded_count += 1
+    if downloaded_count == 0:
+        print(f"⚠️ No .wav files found in '{DOWNLOAD_DIR}' prefix in Firebase Storage.")
 
 # --- DATASET ---
 class VoiceDataset(Dataset):
@@ -79,17 +89,7 @@ class VoiceDataset(Dataset):
         self.files = files
         self.labels = labels
         self.augment = augment
-        # Initialize Mel Spectrogram transform
-        # n_mels: number of mel bands, often 64 or 128
-        # n_fft: FFT window size, often 1024 or 2048
-        # hop_length: number of samples between successive frames
-        self.mel_spectrogram_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=SAMPLE_RATE,
-            n_fft=2048, # Increased FFT size for better frequency resolution
-            hop_length=512,
-            n_mels=128 # More mel bands for richer features
-        )
-        self.amplitude_to_db_transform = torchaudio.transforms.AmplitudeToDB()
+        # No Mel Spectrogram transform here, VGGish handles it internally from raw audio
 
     def __len__(self):
         return len(self.files)
@@ -98,56 +98,68 @@ class VoiceDataset(Dataset):
         path = self.files[idx]
         label = self.labels[idx]
         wav, sr = sf.read(path)
+        # Resample to VGGish expected sample rate (16kHz)
         wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
+        # Ensure fixed length for consistent batching, VGGish handles internal windowing
         wav = librosa.util.fix_length(wav, size=SAMPLE_RATE * DURATION)
 
         if self.augment:
             wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
 
         wav = torch.tensor(wav).float()
-        # torchaudio transforms expect [channels, samples]
-        wav = wav.unsqueeze(0) # Add channel dimension: [1, samples]
+        # VGGish expects [batch_size, samples] for its forward pass
+        # So, we return [samples] here, and DataLoader will batch it correctly.
+        return wav, label
 
-        # Apply Mel Spectrogram transform
-        mel_spec = self.mel_spectrogram_transform(wav)
-        # Convert to dB scale, which is more perceptually relevant
-        mel_spec_db = self.amplitude_to_db_transform(mel_spec)
+# --- MODEL (Transfer Learning with VGGish) ---
+class VGGishFeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # Load pre-trained VGGish model from PyTorch Hub
+        # The 'vggish' model from 'harritaylor/pytorch-vggish' expects raw audio (16kHz)
+        # and performs its own Mel Spectrogram and pooling internally.
+        self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
 
-        return mel_spec_db, label # Return the 2D Mel Spectrogram
+        # Set VGGish to evaluation mode (important for consistent feature extraction)
+        self.vggish.eval()
 
-# --- MODEL ---
-# This CNN will now process 2D Mel Spectrograms, so it needs 2D convolutional layers.
-class ImprovedCNN(nn.Module):
+        # Freeze VGGish parameters to use it as a fixed feature extractor
+        for param in self.vggish.parameters():
+            param.requires_grad = False
+
+    def forward(self, x):
+        # x is [batch_size, num_samples] (raw audio)
+        # VGGish outputs embeddings of shape [batch_size, num_segments, 128]
+        # where 128 is the embedding dimension.
+        embeddings = self.vggish(x)
+
+        # Average pool the embeddings across the time segments
+        # This results in a single 128-dim embedding per audio clip
+        pooled_embeddings = torch.mean(embeddings, dim=1) # Output shape: [batch_size, 128]
+        return pooled_embeddings
+
+class TransferLearningCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        self.model = nn.Sequential(
-            # Input: [batch_size, 1, n_mels, time_frames]
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32), # Add Batch Normalization
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2), # Reduce spatial dimensions
+        # Use the VGGish model as our feature extractor backbone
+        self.feature_extractor = VGGishFeatureExtractor()
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1), # Pool to 1x1 across spatial dimensions
-            nn.Flatten(),
-            nn.Dropout(0.5), # Add Dropout for regularization
-            nn.Linear(256, num_classes) # Output features from AdaptiveAvgPool2d are 256
+        # Define a new classification head that takes VGGish embeddings (128 features)
+        # and outputs probabilities for our specific number of classes.
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64), # First linear layer
+            nn.ReLU(),          # Activation function
+            nn.Dropout(0.5),    # Dropout for regularization
+            nn.Linear(64, num_classes) # Final linear layer to output class scores
         )
 
     def forward(self, x):
-        return self.model(x)
+        # Pass the raw audio through the VGGish feature extractor
+        features = self.feature_extractor(x) # Output: [batch_size, 128]
+
+        # Pass the extracted features through the new classification head
+        output = self.classifier(features)
+        return output
 
 # --- MAIN TRAINING ---
 def main():
@@ -164,38 +176,53 @@ def main():
 
     if not audio_paths:
         print("No audio files found for training. Please ensure 'user_training_data' in Firebase Storage contains .wav files in subdirectories (e.g., user_training_data/speaker1/audio.wav).")
+        print("Training cannot proceed without data.")
         return
 
     label_encoder = LabelEncoder()
     encoded_labels = label_encoder.fit_transform(audio_labels)
     global NUM_CLASSES
     NUM_CLASSES = len(label_encoder.classes_)
+    print(f"Found {len(audio_paths)} audio files across {NUM_CLASSES} classes.")
 
     # Save class map
+    # Using 'json' module directly for saving
     with open("class_to_label.json", "w") as f:
-        import json
         json.dump({str(i): label for i, label in enumerate(label_encoder.classes_)}, f)
+    print("Class map saved to class_to_label.json")
 
     # Stratified split
-    X_train, X_val, y_train, y_val = train_test_split(
-        audio_paths, encoded_labels, test_size=0.2, stratify=encoded_labels, random_state=42
-    )
+    # Ensure there are enough samples for splitting (at least 2 per class for stratification)
+    if len(audio_paths) < 2 or (NUM_CLASSES > 1 and min(np.bincount(encoded_labels)) < 2):
+        print("Not enough samples per class for stratified split. Using non-stratified split or skipping validation.")
+        # Fallback to non-stratified if stratification is impossible
+        X_train, X_val, y_train, y_val = train_test_split(
+            audio_paths, encoded_labels, test_size=0.2, random_state=42
+        )
+    else:
+        X_train, X_val, y_train, y_val = train_test_split(
+            audio_paths, encoded_labels, test_size=0.2, stratify=encoded_labels, random_state=42
+        )
 
     train_dataset = VoiceDataset(X_train, y_train, augment=True)
     val_dataset = VoiceDataset(X_val, y_val, augment=False)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-    # Initialize model with the new ImprovedCNN
-    model = ImprovedCNN(NUM_CLASSES).to(DEVICE)
+    # Initialize model with the new TransferLearningCNN
+    model = TransferLearningCNN(NUM_CLASSES).to(DEVICE)
+    print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
+    print(f"Using device: {DEVICE}")
+
     loss_fn = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Use a slightly smaller learning rate for fine-tuning, or if only training the head
+    optimizer = optim.Adam(model.parameters(), lr=0.0005) # Adjusted learning rate
 
     best_val_acc = 0
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
-        for x, y in train_loader:
+        for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(DEVICE), y.to(DEVICE)
             preds = model(x)
             loss = loss_fn(preds, y)
@@ -203,6 +230,10 @@ def main():
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+
+            if (batch_idx + 1) % 10 == 0: # Print loss every 10 batches
+                print(f"  Batch {batch_idx+1}/{len(train_loader)} - Train Loss: {loss.item():.4f}")
+
 
         # Validation
         model.eval()
