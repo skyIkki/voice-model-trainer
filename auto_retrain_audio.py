@@ -14,6 +14,10 @@ import soundfile as sf
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
 import json # Import json for saving class map
 
+# --- NEW: Import vggish_input for explicit preprocessing ---
+from torchvggish import vggish_input
+# --- END NEW ---
+
 # --- CONFIGURATION ---
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
 DOWNLOAD_DIR = "user_training_data"
@@ -129,8 +133,16 @@ class VGGishFeatureExtractor(nn.Module):
 
     def forward(self, x):
         # x is [batch_size, num_samples] (raw audio)
-        # VGGish's forward method expects the sample rate as a second argument
-        embeddings = self.vggish(x, fs=SAMPLE_RATE) # FIXED: Pass SAMPLE_RATE explicitly
+        # We now explicitly preprocess the waveform to VGGish examples (Mel Spectrograms)
+        # This bypasses the problematic _preprocess method in vggish.py
+        # vggish_input.waveform_to_examples expects a 1D numpy array or a 2D tensor [batch_size, samples]
+        # and returns [batch_size, num_frames, num_mels]
+        examples_batch = vggish_input.waveform_to_examples(x.cpu().numpy(), SAMPLE_RATE)
+        examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
+
+        # Pass the preprocessed examples through VGGish's feature extraction layers
+        # The vggish model's forward method can take these examples directly
+        embeddings = self.vggish.forward(examples_batch) # Pass the preprocessed examples
 
         # Average pool the embeddings across the time segments
         # This results in a single 128-dim embedding per audio clip
