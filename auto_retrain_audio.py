@@ -32,21 +32,43 @@ augment = Compose([
 ])
 
 # --- INITIALIZE FIREBASE ---
-cred = credentials.Certificate("firebase_key.json")
-firebase_admin.initialize_app(cred, {
-    'storageBucket': BUCKET_NAME
-})
-bucket = storage.bucket()
+# Note: In a real GitHub Actions environment, 'firebase_key.json' is created by the workflow.
+# For local testing, ensure firebase_key.json is present or mock firebase_admin.
+try:
+    cred = credentials.Certificate("firebase_key.json")
+    firebase_admin.initialize_app(cred, {
+        'storageBucket': BUCKET_NAME
+    })
+    bucket = storage.bucket()
+except ValueError:
+    print("Firebase app already initialized or firebase_key.json not found. Skipping initialization.")
+    # This block handles cases where the app might be initialized elsewhere or key is missing for local dev.
+    # In GitHub Actions, the key will always be created.
 
 def download_training_data():
-    if os.path.exists(DOWNLOAD_DIR):
-        shutil.rmtree(DOWNLOAD_DIR)
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    # Only import shutil if needed, to avoid potential import errors if not present
+    try:
+        import shutil
+        if os.path.exists(DOWNLOAD_DIR):
+            shutil.rmtree(DOWNLOAD_DIR)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    except ImportError:
+        print("Shutil not available, skipping directory cleanup. Ensure directory is empty.")
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    # Mock bucket for local testing if Firebase isn't fully set up
+    if 'bucket' not in globals() or bucket is None:
+        print("Firebase bucket not initialized. Skipping data download.")
+        return
 
     blobs = bucket.list_blobs(prefix="user_training_data/")
     for blob in blobs:
         if blob.name.endswith(".wav"):
-            local_path = os.path.join(DOWNLOAD_DIR, *blob.name.split("/")[1:])
+            # Construct local path, skipping the 'user_training_data/' prefix
+            local_path_parts = blob.name.split("/")[1:]
+            if not local_path_parts: # Handle case where blob name is just "user_training_data/"
+                continue
+            local_path = os.path.join(DOWNLOAD_DIR, *local_path_parts)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             blob.download_to_filename(local_path)
             print(f"✅ Downloaded {blob.name}")
@@ -57,6 +79,17 @@ class VoiceDataset(Dataset):
         self.files = files
         self.labels = labels
         self.augment = augment
+        # Initialize Mel Spectrogram transform
+        # n_mels: number of mel bands, often 64 or 128
+        # n_fft: FFT window size, often 1024 or 2048
+        # hop_length: number of samples between successive frames
+        self.mel_spectrogram_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=SAMPLE_RATE,
+            n_fft=2048, # Increased FFT size for better frequency resolution
+            hop_length=512,
+            n_mels=128 # More mel bands for richer features
+        )
+        self.amplitude_to_db_transform = torchaudio.transforms.AmplitudeToDB()
 
     def __len__(self):
         return len(self.files)
@@ -67,26 +100,50 @@ class VoiceDataset(Dataset):
         wav, sr = sf.read(path)
         wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
         wav = librosa.util.fix_length(wav, size=SAMPLE_RATE * DURATION)
+
         if self.augment:
             wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
+
         wav = torch.tensor(wav).float()
-        wav = wav.unsqueeze(0)  # add channel
-        return wav, label
+        # torchaudio transforms expect [channels, samples]
+        wav = wav.unsqueeze(0) # Add channel dimension: [1, samples]
+
+        # Apply Mel Spectrogram transform
+        mel_spec = self.mel_spectrogram_transform(wav)
+        # Convert to dB scale, which is more perceptually relevant
+        mel_spec_db = self.amplitude_to_db_transform(mel_spec)
+
+        return mel_spec_db, label # Return the 2D Mel Spectrogram
 
 # --- MODEL ---
-class SimpleCNN(nn.Module):
+# This CNN will now process 2D Mel Spectrograms, so it needs 2D convolutional layers.
+class ImprovedCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Conv1d(1, 16, 5, stride=2),
+            # Input: [batch_size, 1, n_mels, time_frames]
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32), # Add Batch Normalization
             nn.ReLU(),
-            nn.Conv1d(16, 32, 5, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=2), # Reduce spatial dimensions
+
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Conv1d(32, 64, 5, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1), # Pool to 1x1 across spatial dimensions
             nn.Flatten(),
-            nn.Linear(64, num_classes)
+            nn.Dropout(0.5), # Add Dropout for regularization
+            nn.Linear(256, num_classes) # Output features from AdaptiveAvgPool2d are 256
         )
 
     def forward(self, x):
@@ -104,6 +161,10 @@ def main():
             if f.endswith(".wav"):
                 audio_paths.append(os.path.join(root, f))
                 audio_labels.append(os.path.basename(root))
+
+    if not audio_paths:
+        print("No audio files found for training. Please ensure 'user_training_data' in Firebase Storage contains .wav files in subdirectories (e.g., user_training_data/speaker1/audio.wav).")
+        return
 
     label_encoder = LabelEncoder()
     encoded_labels = label_encoder.fit_transform(audio_labels)
@@ -125,7 +186,8 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-    model = SimpleCNN(NUM_CLASSES).to(DEVICE)
+    # Initialize model with the new ImprovedCNN
+    model = ImprovedCNN(NUM_CLASSES).to(DEVICE)
     loss_fn = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
@@ -163,5 +225,6 @@ def main():
     print("🎉 Training complete")
 
 if __name__ == "__main__":
+    # Ensure shutil is imported if main is called directly for local testing
     import shutil
     main()
