@@ -27,15 +27,16 @@ jobs:
     - name: 📦 Install dependencies
       run: pip install -r requirements.txt
 
+    - name: 🔐 Create firebase_key.json
+      run: echo "${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}" | base64 --decode > firebase_key.json
+
     - name: 🧠 Run retraining script
-      env:
-        FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
       run: python auto_retrain_audio.py
 
     - name: 🧹 Cleanup artifacts
       run: |
         rm -rf voice_training_data
-        rm -f best_voice_model.pt class_to_label.json best_weights.pth
+        rm -f best_voice_model.pt class_to_label.json firebase_key.json
 
     - name: ✅ Done
       run: echo "✅ Voice model retraining complete!"
