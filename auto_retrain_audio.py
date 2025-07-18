@@ -1,135 +1,154 @@
 import os
-import json
-import torch
-import torchaudio
-from torch import nn, optim
-from torch.utils.data import DataLoader
-from torchvision import transforms
 import firebase_admin
 from firebase_admin import credentials, storage
-from pathlib import Path
+import torch
+import torchaudio
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 import random
-import shutil
+from sklearn.model_selection import train_test_split
 
-# --- CONFIGURATION ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-FIREBASE_CRED_JSON = "firebase_key.json"
-FIREBASE_BUCKET_NAME = "your-firebase-project.appspot.com"  # 🔁 Replace with yours
-STORAGE_FOLDER = "user_training_data"
-LOCAL_DATA_DIR = "voice_training_data"
-MODEL_SAVE_PATH = "best_voice_model.pt"
-LABEL_MAP_PATH = "class_to_label.json"
-BATCH_SIZE = 16
-EPOCHS = 10
-LEARNING_RATE = 0.001
+# --- CONFIG ---
+BUCKET_NAME = 'your-bucket-name.appspot.com'  # Change this to your actual bucket name
+LOCAL_DATA_DIR = 'voice_training_data'
+FOLDER_IN_FIREBASE = 'user_training_data'
 
-# --- SETUP FIREBASE ---
-if not os.path.exists(FIREBASE_CRED_JSON):
-    with open(FIREBASE_CRED_JSON, "w") as f:
-        f.write(os.environ["FIREBASE_SERVICE_ACCOUNT_KEY"])
-
-cred = credentials.Certificate(FIREBASE_CRED_JSON)
-firebase_admin.initialize_app(cred, {"storageBucket": FIREBASE_BUCKET_NAME})
+# --- FIREBASE SETUP ---
+cred = credentials.Certificate({
+    "type": "service_account",
+    "project_id": os.getenv('FIREBASE_PROJECT_ID'),
+    "private_key_id": os.getenv('FIREBASE_PRIVATE_KEY_ID'),
+    "private_key": os.getenv('FIREBASE_PRIVATE_KEY').replace('\\n', '\n'),
+    "client_email": os.getenv('FIREBASE_CLIENT_EMAIL'),
+    "client_id": os.getenv('FIREBASE_CLIENT_ID'),
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": os.getenv('FIREBASE_CLIENT_CERT_URL')
+})
+firebase_admin.initialize_app(cred, {'storageBucket': BUCKET_NAME})
 bucket = storage.bucket()
 
-# --- DOWNLOAD AUDIO DATA FROM FIREBASE STORAGE ---
-def download_data():
-    if os.path.exists(LOCAL_DATA_DIR):
-        shutil.rmtree(LOCAL_DATA_DIR)
-    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
-
-    blobs = bucket.list_blobs(prefix=STORAGE_FOLDER + "/")
+# --- DOWNLOAD USER AUDIO ---
+def download_training_data():
+    print("📥 Downloading user training data from Firebase...")
+    blobs = bucket.list_blobs(prefix=FOLDER_IN_FIREBASE + '/')
     for blob in blobs:
-        if blob.name.endswith(".wav"):
-            local_path = os.path.join(LOCAL_DATA_DIR, *blob.name.split("/")[1:])
+        if not blob.name.endswith('/'):
+            local_path = os.path.join(LOCAL_DATA_DIR, os.path.relpath(blob.name, FOLDER_IN_FIREBASE))
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
             blob.download_to_filename(local_path)
             print(f"✅ Downloaded: {blob.name}")
+    print("✅ All user audio downloaded.")
 
 # --- AUDIO DATASET CLASS ---
-class VoiceDataset(torch.utils.data.Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = Path(root_dir)
+class AudioDataset(Dataset):
+    def __init__(self, files, labels, transform=None):
+        self.files = files
+        self.labels = labels
         self.transform = transform
-        self.samples = []
-        self.label_to_class = {}
-
-        for idx, label_dir in enumerate(sorted(os.listdir(root_dir))):
-            label_path = self.root_dir / label_dir
-            if not label_path.is_dir(): continue
-            self.label_to_class[idx] = label_dir
-            for audio_file in label_path.glob("*.wav"):
-                self.samples.append((audio_file, idx))
-
-        with open(LABEL_MAP_PATH, "w") as f:
-            json.dump(self.label_to_class, f)
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.files)
 
     def __getitem__(self, idx):
-        audio_path, label = self.samples[idx]
-        waveform, sample_rate = torchaudio.load(audio_path)
-
+        file_path = self.files[idx]
+        waveform, sample_rate = torchaudio.load(file_path)
         if self.transform:
             waveform = self.transform(waveform)
-
-        return waveform, label
+        return waveform.mean(dim=0), self.labels[idx]  # Mono
 
 # --- SIMPLE MODEL ---
-class SimpleCNN(nn.Module):
-    def __init__(self, num_classes):
+class SimpleClassifier(nn.Module):
+    def __init__(self, input_size, num_classes):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=3, stride=1, padding=1),
+            nn.Linear(input_size, 128),
             nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
+            nn.Linear(128, num_classes)
         )
-        self.classifier = nn.Linear(32, num_classes)
 
     def forward(self, x):
-        x = self.net(x)
-        x = x.view(x.size(0), -1)
-        return self.classifier(x)
+        return self.net(x)
+
+# --- FEATURE EXTRACTION ---
+def extract_features(waveform):
+    return torch.mean(waveform, dim=1)
 
 # --- TRAINING FUNCTION ---
-def train_model(model, loader, criterion, optimizer):
-    model.train()
-    for epoch in range(EPOCHS):
-        total_loss = 0
-        for batch in loader:
-            inputs, labels = batch
-            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
-            inputs = inputs.mean(dim=1, keepdim=True)  # mono
+def train_model(train_loader, test_loader, input_size, num_classes):
+    model = SimpleClassifier(input_size, num_classes)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    epochs = 10
+
+    best_accuracy = 0
+    for epoch in range(epochs):
+        model.train()
+        for data, labels in train_loader:
+            data = extract_features(data).view(data.size(0), -1)
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(data)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {total_loss:.4f}")
+
+        # Validation
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for data, labels in test_loader:
+                data = extract_features(data).view(data.size(0), -1)
+                outputs = model(data)
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        acc = 100 * correct / total
+        print(f"Epoch [{epoch+1}/{epochs}], Accuracy: {acc:.2f}%")
+        if acc > best_accuracy:
+            best_accuracy = acc
+            torch.save(model.state_dict(), "best_voice_model.pt")
+            print("💾 Best model saved.")
 
 # --- MAIN ---
 if __name__ == "__main__":
-    print("⬇️ Downloading audio data...")
-    download_data()
+    download_training_data()
 
-    print("🗃️ Preparing dataset...")
-    transform = torchaudio.transforms.Resample(orig_freq=44100, new_freq=16000)
-    dataset = VoiceDataset(LOCAL_DATA_DIR, transform=transform)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    # Collect all files and labels
+    print("🗂️ Preparing dataset...")
+    files = []
+    labels = []
+    label_map = {}
+    current_label = 0
+    for root, dirs, filenames in os.walk(LOCAL_DATA_DIR):
+        for f in filenames:
+            if f.endswith('.wav'):
+                label_name = os.path.basename(root)
+                if label_name not in label_map:
+                    label_map[label_name] = current_label
+                    current_label += 1
+                files.append(os.path.join(root, f))
+                labels.append(label_map[label_name])
 
-    print("🧠 Training model...")
-    model = SimpleCNN(num_classes=len(dataset.label_to_class)).to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    with open("class_to_label.json", "w") as f:
+        import json
+        json.dump(label_map, f)
 
-    train_model(model, loader, criterion, optimizer)
+    # Shuffle and split
+    combined = list(zip(files, labels))
+    random.shuffle(combined)
+    files[:], labels[:] = zip(*combined)
+    train_files, test_files, train_labels, test_labels = train_test_split(files, labels, test_size=0.2)
 
-    print(f"💾 Saving model to {MODEL_SAVE_PATH}...")
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    train_dataset = AudioDataset(train_files, train_labels)
+    test_dataset = AudioDataset(test_files, test_labels)
 
-    print("✅ Done!")
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
+
+    print("🚀 Starting training...")
+    dummy_input_size = 1  # Placeholder for input shape; we'll use raw waveform mean
+    train_model(train_loader, test_loader, input_size=dummy_input_size, num_classes=len(label_map))
+    print("✅ Training complete!")
