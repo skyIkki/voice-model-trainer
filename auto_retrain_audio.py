@@ -1,194 +1,156 @@
-#!/usr/bin/env python3
-import os, json, logging, random, shutil, base64
-import torch, torchaudio
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
-from torchvision import models
-import firebase_admin
-from firebase_admin import credentials, storage
+import os
+import torch
+import torchaudio
+import logging
+import random
+import numpy as np
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader, random_split
+
+try:
+    from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
+    USE_AUGMENT = True
+except ImportError:
+    USE_AUGMENT = False
 
 # --- CONFIGURATION ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_FILE = "best_voice_model.pt"
-LABEL_FILE = "class_to_label.json"
-USER_DIR = "voice_training_data"
-BASE_DIR = "base_training_data"
-USER_PREFIX = "user_training_data/"
-MODEL_PREFIX = ""
-BATCH_SIZE, LR, EPOCHS = 32, 0.001, 15
-VAL_RATIO = 0.2
+DATA_DIR = "voice_training_data"
+MODEL_PATH = "models/audio_model.pt"
+SAMPLE_RATE = 16000
+NUM_EPOCHS = 15
+BATCH_SIZE = 4
+LEARNING_RATE = 0.001
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+# --- LOGGER ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
+# --- AUDIO AUGMENTATION ---
+if USE_AUGMENT:
+    augment = Compose([
+        AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+        TimeStretch(min_rate=0.8, max_rate=1.25, p=0.3),
+        PitchShift(min_semitones=-4, max_semitones=4, p=0.4),
+        Shift(min_fraction=-0.5, max_fraction=0.5, p=0.3)
+    ])
+else:
+    augment = None
 
-def set_seed(s=42):
-    random.seed(s)
-    torch.manual_seed(s)
-
-
-set_seed()
-
-# --- FIREBASE INITIALIZATION ---
-def init_firebase():
-    key = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY")
-    json_key = json.loads(base64.b64decode(key))
-    cred = credentials.Certificate(json_key)
-    firebase_admin.initialize_app(cred, {
-        "storageBucket": "voice-model-trainer-b6814.firebasestorage.app"
-    })
-
-# --- DOWNLOAD USER AUDIO ---
-def download_user_audio():
-    os.makedirs(USER_DIR, exist_ok=True)
-    bucket = storage.bucket()
-    for blob in bucket.list_blobs(prefix=USER_PREFIX):
-        if blob.name.endswith("/"):
-            continue
-        rel = blob.name[len(USER_PREFIX):]
-        target = os.path.join(USER_DIR, rel)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        blob.download_to_filename(target)
-        logging.debug(f"🎧 {blob.name} → {target}")
-
-# --- AUDIO DATASET ---
+# --- DATASET ---
 class AudioDataset(Dataset):
-    def __init__(self, root):
-        self.samples, self.labels = [], {}
-        for speaker in sorted(os.listdir(root)):
-            path = os.path.join(root, speaker)
-            if os.path.isdir(path):
-                idx = len(self.labels)
-                self.labels[speaker] = idx
-                for f in os.listdir(path):
-                    if f.lower().endswith(".wav"):
-                        self.samples.append((os.path.join(path, f), idx))
-        logging.info(f"📂 Loaded {len(self.samples)} samples from {root}")
+    def __init__(self, root_dir, transform=None):
+        self.samples = []
+        self.labels = []
+        self.transform = transform
+        self.label_map = {}
+        for idx, label in enumerate(sorted(os.listdir(root_dir))):
+            label_dir = os.path.join(root_dir, label)
+            if os.path.isdir(label_dir):
+                self.label_map[label] = idx
+                for file in os.listdir(label_dir):
+                    if file.endswith(".wav"):
+                        self.samples.append(os.path.join(label_dir, file))
+                        self.labels.append(idx)
+        logging.info(f"📂 Loaded {len(self.samples)} samples from {root_dir}")
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
 
-    def __getitem__(self, i):
-        path, label = self.samples[i]
-        wav, sr = torchaudio.load(path)
-        wav = wav / wav.abs().max()
-        spec = torchaudio.transforms.MelSpectrogram()(wav)
-        spec = torchaudio.transforms.AmplitudeToDB()(spec)
-        if spec.shape[-1] < 128:
-            spec = torch.nn.functional.pad(spec, (0, 128 - spec.shape[-1]))
-        spec = spec[:, :, :128]  # [1, 128, 128]
-        return spec, label
+    def __getitem__(self, idx):
+        waveform, sr = torchaudio.load(self.samples[idx])
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-# --- PREPARE DATA ---
-def prepare_data():
-    datasets = []
-    for d in [BASE_DIR, USER_DIR]:
-        if os.path.isdir(d):
-            datasets.append(AudioDataset(d))
-    assert datasets, "No data!"
-    full = torch.utils.data.ConcatDataset(datasets)
-    n = len(full)
-    v = int(n * VAL_RATIO)
-    t = n - v
-    return random_split(full, [t, v])
+        if sr != SAMPLE_RATE:
+            waveform = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(waveform)
+
+        if augment:
+            waveform = torch.tensor(
+                augment(samples=waveform.numpy(), sample_rate=SAMPLE_RATE)
+            )
+
+        mel_spec = torchaudio.transforms.MelSpectrogram(
+            sample_rate=SAMPLE_RATE, n_mels=64
+        )(waveform)
+        mel_spec = torchaudio.transforms.AmplitudeToDB()(mel_spec)
+        return mel_spec, self.labels[idx]
 
 # --- MODEL ---
-def build_model(num_classes):
-    m = models.resnet18(weights=None)
-    m.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    m.fc = nn.Linear(m.fc.in_features, num_classes)
-    return m.to(DEVICE)
-
-# --- WRAPPER FOR EXPORT ---
-class VoiceWrapper(nn.Module):
-    def __init__(self, model):
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes):
         super().__init__()
-        self.model = model
-        self.melspec = torchaudio.transforms.MelSpectrogram(n_fft=400, hop_length=160, n_mels=128)
-        self.db = torchaudio.transforms.AmplitudeToDB()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32 * 14 * 14, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes),
+        )
 
-    def forward(self, wav):  # wav: shape [1, num_samples]
-        if wav.dim() == 2 and wav.size(0) == 1:
-            spec = self.melspec(wav)           # [1, 128, time]
-            spec = self.db(spec)
-            if spec.shape[-1] < 128:
-                spec = torch.nn.functional.pad(spec, (0, 128 - spec.shape[-1]))
-            spec = spec[:, :, :128]            # [1, 128, 128]
-            spec = spec.unsqueeze(0)           # ✅ [1, 1, 128, 128]
-            return self.model(spec)
-        else:
-            raise ValueError("Expected input shape [1, num_samples]")
+    def forward(self, x):
+        return self.fc(self.conv(x))
 
-# --- TRAIN AND SAVE ---
+# --- TRAINING ---
 def train_and_save():
-    train_ds, val_ds = prepare_data()
-    num_classes = len({y for _, y in train_ds})
-    model = build_model(num_classes)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    crit = nn.CrossEntropyLoss()
+    dataset = AudioDataset(DATA_DIR)
+    if len(dataset) == 0:
+        logging.warning("❌ No audio samples found.")
+        return
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
+    num_classes = len(set(dataset.labels))
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_data, val_data = random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=BATCH_SIZE)
 
-    best_loss = float("inf")
+    model = SimpleCNN(num_classes)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-    for epoch in range(EPOCHS):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    for epoch in range(NUM_EPOCHS):
         model.train()
-        total_loss, correct, total = 0, 0, 0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            opt.zero_grad()
-            out = model(xb)
-            loss = crit(out, yb)
+        total_loss = 0
+        correct = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
-            opt.step()
+            optimizer.step()
             total_loss += loss.item()
-            preds = out.argmax(dim=1)
-            correct += (preds == yb).sum().item()
-            total += yb.size(0)
+            correct += (outputs.argmax(1) == targets).sum().item()
 
-        avg_loss = total_loss / len(train_loader)
-        acc = 100 * correct / total
-        logging.info(f"📦 Epoch {epoch + 1}/{EPOCHS} - Loss: {avg_loss:.4f} - Acc: {acc:.2f}%")
+        acc = 100.0 * correct / len(train_data)
+        logging.info(f"📦 Epoch {epoch+1}/{NUM_EPOCHS} - Loss: {total_loss:.4f} - Acc: {acc:.2f}%")
 
-        # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-                out = model(xb)
-                loss = crit(out, yb)
-                val_loss += loss.item()
-        val_loss /= len(val_loader)
-        logging.info(f"🔍 Val Loss: {val_loss:.4f}")
-        if val_loss < best_loss:
-            best_loss = val_loss
-            torch.save(model.state_dict(), "best_weights.pth")
-            logging.info("✅ Best model updated")
+        # Validate
+        if len(val_loader) > 0:
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    val_loss += loss.item()
+            val_loss /= len(val_loader)
+            logging.info(f"✅ Validation Loss: {val_loss:.4f}")
 
-    # Load best weights
-    if os.path.exists("best_weights.pth"):
-        model.load_state_dict(torch.load("best_weights.pth"))
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    torch.save(model.state_dict(), MODEL_PATH)
+    logging.info(f"💾 Model saved to {MODEL_PATH}")
 
-    # Export with wrapper for Android
-    wrapped = VoiceWrapper(model.cpu())
-    torch.jit.script(wrapped).save(MODEL_FILE)
-    logging.info(f"🧠 Exported wrapped model as {MODEL_FILE}")
-
-    # Save label map
-    cls_map = {i: name for name, i in train_ds.dataset.datasets[0].labels.items()}
-    with open(LABEL_FILE, "w") as f:
-        json.dump(cls_map, f)
-    logging.info(f"📄 Saved label map to {LABEL_FILE}")
-
-    # Upload to Firebase
-    bucket = storage.bucket()
-    for fname in [MODEL_FILE, LABEL_FILE]:
-        blob = bucket.blob(os.path.join(MODEL_PREFIX, fname))
-        blob.upload_from_filename(fname)
-        logging.info(f"☁️ Uploaded {fname} to Firebase")
-
-# --- MAIN ---
+# --- ENTRY POINT ---
 if __name__ == "__main__":
-    init_firebase()
-    download_user_audio()
     train_and_save()
