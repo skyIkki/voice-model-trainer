@@ -1,41 +1,31 @@
-name: 🎙️ Retrain Voice Model
+name: Voice Model Trainer
 
 on:
+  workflow_dispatch:  # allows you to manually trigger it from GitHub UI
   push:
     branches: [ main ]
-    paths: 
-      - 'auto_retrain_audio.py'
-      - 'requirements.txt'
-  schedule:
-    - cron: '0 0 * * *'  # Runs daily at midnight UTC
-  workflow_dispatch:  # Manual trigger
 
 jobs:
-  train:
+  run-trainer:
     runs-on: ubuntu-latest
 
     steps:
-    - name: 📥 Checkout repository
+    - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: 🐍 Set up Python
-      uses: actions/setup-python@v5
+    - name: Set up Python
+      uses: actions/setup-python@v4
       with:
         python-version: '3.10'
-        cache: 'pip'
 
-    - name: 📦 Install dependencies
-      run: pip install -r requirements.txt
-
-    - name: 🧠 Run retraining script
-      env:
-        FIREBASE_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
-      run: python auto_retrain_audio.py
-
-    - name: 🧹 Cleanup artifacts
+    - name: Install dependencies
       run: |
-        rm -rf voice_training_data
-        rm -f best_voice_model.pt class_to_label.json best_weights.pth
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
 
-    - name: ✅ Done
-      run: echo "✅ Voice model retraining complete!"
+    - name: Write Firebase service key to file
+      run: |
+        echo "${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}" > firebase_key.json
+
+    - name: Run the training script
+      run: python auto_retrain_audio.py
