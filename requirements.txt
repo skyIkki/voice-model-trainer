@@ -8,3 +8,4 @@ numpy
 scikit-learn
 soundfile
 audiomentations>=0.33.0
+resampy # ADD THIS LINE
