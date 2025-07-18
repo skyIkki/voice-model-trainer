@@ -14,8 +14,12 @@ import soundfile as sf
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
 import json # Import json for saving class map
 
-# --- NEW: Import vggish_input for explicit preprocessing ---
-from torchvggish import vggish_input
+# --- NEW: Conditional import for vggish_input and sys ---
+import sys
+import torch.hub
+
+# We will import vggish_input after loading the model to ensure it's in cache
+vggish_input = None # Placeholder
 # --- END NEW ---
 
 # --- CONFIGURATION ---
@@ -32,7 +36,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 augment = Compose([
     AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
     TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
-    PitchShift(min_semitones=-2, max_semitones=2, p=0.5), # Corrected max_semitones to 2
+    PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
     Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
 ])
 
@@ -120,9 +124,23 @@ class VGGishFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
         # Load pre-trained VGGish model from PyTorch Hub
-        # The 'vggish' model from 'harritaylor/pytorch-vggish' expects raw audio (16kHz)
-        # and performs its own Mel Spectrogram and pooling internally.
+        # This will download the repository to the cache if not present
         self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
+
+        # --- NEW: Dynamically add the torchvggish path to sys.path and import vggish_input ---
+        global vggish_input # Access the global placeholder
+        if vggish_input is None: # Only import once
+            # Get the path where torch.hub.load cloned the repo
+            vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
+            torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
+            if torchvggish_path not in sys.path:
+                sys.path.insert(0, torchvggish_path) # Add to path
+            try:
+                from torchvggish import vggish_input as imported_vggish_input # Import with alias
+                vggish_input = imported_vggish_input # Assign to global placeholder
+            except ImportError as e:
+                raise ImportError(f"Failed to import vggish_input from {torchvggish_path}. Error: {e}")
+        # --- END NEW ---
 
         # Set VGGish to evaluation mode (important for consistent feature extraction)
         self.vggish.eval()
@@ -137,6 +155,11 @@ class VGGishFeatureExtractor(nn.Module):
         # This bypasses the problematic _preprocess method in vggish.py
         # vggish_input.waveform_to_examples expects a 1D numpy array or a 2D tensor [batch_size, samples]
         # and returns [batch_size, num_frames, num_mels]
+        # Ensure vggish_input is not None before using it
+        if vggish_input is None:
+            raise RuntimeError("vggish_input was not successfully loaded. Check VGGishFeatureExtractor __init__.")
+
+        # Move tensor to CPU for numpy conversion, then back to device
         examples_batch = vggish_input.waveform_to_examples(x.cpu().numpy(), SAMPLE_RATE)
         examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
 
