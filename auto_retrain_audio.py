@@ -28,7 +28,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 augment = Compose([
     AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
     TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
-    PitchShift(min_semitones=-2, max_semitones=-2, p=0.5), # Corrected min_semitones
+    PitchShift(min_semitones=-2, max_semitones=2, p=0.5), # Corrected max_semitones to 2
     Shift(min_shift=-0.5, max_shift=0.5, p=0.5),
 ])
 
@@ -129,9 +129,8 @@ class VGGishFeatureExtractor(nn.Module):
 
     def forward(self, x):
         # x is [batch_size, num_samples] (raw audio)
-        # VGGish outputs embeddings of shape [batch_size, num_segments, 128]
-        # where 128 is the embedding dimension.
-        embeddings = self.vggish(x)
+        # VGGish's forward method expects the sample rate as a second argument
+        embeddings = self.vggish(x, fs=SAMPLE_RATE) # FIXED: Pass SAMPLE_RATE explicitly
 
         # Average pool the embeddings across the time segments
         # This results in a single 128-dim embedding per audio clip
