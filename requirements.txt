@@ -7,3 +7,4 @@ librosa
 numpy
 scikit-learn
 soundfile
+audiomentations
