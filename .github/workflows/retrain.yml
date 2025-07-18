@@ -3,7 +3,7 @@ name: 🎙️ Retrain Voice Model
 on:
   push:
     branches: [ main ]
-    paths: 
+    paths:
       - 'auto_retrain_audio.py'
       - 'requirements.txt'
   schedule:
@@ -13,6 +13,10 @@ on:
 jobs:
   train:
     runs-on: ubuntu-latest
+    # --- NEW: Add environment variable for GitHub Token ---
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # --- END NEW ---
 
     steps:
     - name: 📥 Checkout repository
@@ -35,7 +39,7 @@ jobs:
 
     - name: 🧹 Cleanup artifacts
       run: |
-        rm -rf voice_training_data
+        rm -rf user_training_data # Corrected directory name based on your script
         rm -f best_voice_model.pt class_to_label.json firebase_key.json
 
     - name: ✅ Done
