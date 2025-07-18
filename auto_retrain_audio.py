@@ -106,17 +106,32 @@ class VoiceDataset(Dataset):
         path = self.files[idx]
         label = self.labels[idx]
         
-        # We already pre-filtered in main(), so this should be mostly safe.
-        # However, keep the robust length fixing just in case.
+        target_length_samples = SAMPLE_RATE * DURATION
+        # Initialize wav with zeros of the target length. This ensures a valid array even if read fails.
+        wav = np.zeros(target_length_samples, dtype=np.float32) 
+        
         try:
-            wav, sr = sf.read(path)
-            wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
+            read_wav, sr = sf.read(path)
+            if read_wav.size == 0: # Explicitly handle empty audio files
+                print(f"⚠️ Warning: Audio file {path} is empty after sf.read. Using zero-padded array.")
+                # 'wav' is already initialized to zeros, so no further action needed here.
+            else:
+                resampled_wav = librosa.resample(read_wav, orig_sr=sr, target_sr=SAMPLE_RATE)
+                
+                if len(resampled_wav) < target_length_samples:
+                    wav = np.pad(resampled_wav, (0, target_length_samples - len(resampled_wav)), 'constant')
+                elif len(resampled_wav) > target_length_samples:
+                    wav = resampled_wav[:target_length_samples]
+                else:
+                    wav = resampled_wav # Length is already correct
 
-            target_length_samples = SAMPLE_RATE * DURATION
-            if len(wav) < target_length_samples:
-                wav = np.pad(wav, (0, target_length_samples - len(wav)), 'constant')
-            elif len(wav) > target_length_samples:
-                wav = wav[:target_length_samples]
+            # Optional: Final check for valid size and non-zero content after all processing.
+            # This is more for debugging and ensuring data integrity.
+            if wav.size != target_length_samples:
+                print(f"❌ Error: Final processed audio for {path} has incorrect size {wav.size}. Expected {target_length_samples}. Returning dummy data.")
+                return torch.zeros(target_length_samples).float(), -1
+            if np.all(wav == 0) and read_wav.size > 0: # Only warn if original was not empty
+                print(f"⚠️ Warning: Audio file {path} became all zeros after processing, but original was not empty. Check source.")
 
             if self.augment:
                 wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
@@ -124,9 +139,9 @@ class VoiceDataset(Dataset):
             wav = torch.tensor(wav).float()
             return wav, label
         except Exception as e:
-            print(f"❌ Error processing audio in __getitem__ for {path}: {e}. Returning dummy data.")
+            print(f"❌ Error processing audio in __getitem__ for {path}: {e}. Returning dummy (zero) data.")
             # Return a zero tensor and a dummy label to avoid crashing the DataLoader
-            return torch.zeros(SAMPLE_RATE * DURATION).float(), -1
+            return torch.zeros(target_length_samples).float(), -1
 
 
 # --- MODEL (Transfer Learning with VGGish) ---
