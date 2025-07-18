@@ -14,7 +14,7 @@ import soundfile as sf
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
 import json # Import json for saving class map
 
-# --- NEW: Import sys and torch.hub, but remove direct vggish_input import here ---
+# --- NEW: Import sys and torch.hub ---
 import sys
 import torch.hub
 
@@ -105,36 +105,29 @@ class VoiceDataset(Dataset):
     def __getitem__(self, idx):
         path = self.files[idx]
         label = self.labels[idx]
-        wav, sr = sf.read(path)
-        # Resample to VGGish expected sample rate (16kHz)
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
+        
+        # We already pre-filtered in main(), so this should be mostly safe.
+        # However, keep the robust length fixing just in case.
+        try:
+            wav, sr = sf.read(path)
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
 
-        # --- NEW: Robust length fixing and validation ---
-        target_length_samples = SAMPLE_RATE * DURATION
-        if len(wav) < target_length_samples:
-            # Pad with zeros if too short
-            wav = np.pad(wav, (0, target_length_samples - len(wav)), 'constant')
-        elif len(wav) > target_length_samples:
-            # Truncate if too long
-            wav = wav[:target_length_samples]
+            target_length_samples = SAMPLE_RATE * DURATION
+            if len(wav) < target_length_samples:
+                wav = np.pad(wav, (0, target_length_samples - len(wav)), 'constant')
+            elif len(wav) > target_length_samples:
+                wav = wav[:target_length_samples]
 
-        # Critical check: Ensure the waveform is not empty or invalid after processing
-        if wav.size == 0 or np.all(wav == 0):
-            # Handle cases where audio might be problematic (e.g., completely silent or too short to process)
-            # For training, you might want to skip this sample or replace it with a valid one.
-            # For now, we'll return a zero tensor and log a warning.
-            print(f"⚠️ Warning: Processed audio for {path} is empty or all zeros. Skipping or handling gracefully.")
-            # Return a zero tensor of expected shape and a dummy label to avoid crashing the DataLoader
-            return torch.zeros(target_length_samples).float(), -1 # -1 can indicate invalid label, handle in training loop
-        # --- END NEW ---
+            if self.augment:
+                wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
 
-        if self.augment:
-            wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
+            wav = torch.tensor(wav).float()
+            return wav, label
+        except Exception as e:
+            print(f"❌ Error processing audio in __getitem__ for {path}: {e}. Returning dummy data.")
+            # Return a zero tensor and a dummy label to avoid crashing the DataLoader
+            return torch.zeros(SAMPLE_RATE * DURATION).float(), -1
 
-        wav = torch.tensor(wav).float()
-        # VGGish expects [batch_size, samples] for its forward pass
-        # So, we return [samples] here, and DataLoader will batch it correctly.
-        return wav, label
 
 # --- MODEL (Transfer Learning with VGGish) ---
 class VGGishFeatureExtractor(nn.Module):
@@ -180,7 +173,13 @@ class VGGishFeatureExtractor(nn.Module):
 
         # Move tensor to CPU for numpy conversion, then back to device
         # Ensure x is contiguous before converting to numpy
-        examples_batch = _vggish_input_module.waveform_to_examples(x.cpu().contiguous().numpy(), SAMPLE_RATE) # ADDED .contiguous()
+        # Handle potential empty input from collate_fn if all samples in a batch were problematic
+        if x.numel() == 0: # Check if the tensor is empty
+            # Return a dummy tensor of the expected output shape if input is empty
+            # This prevents crashing but means this batch won't contribute to training
+            return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
+
+        examples_batch = _vggish_input_module.waveform_to_examples(x.cpu().contiguous().numpy(), SAMPLE_RATE)
         examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
 
         # Pass the preprocessed examples through VGGish's feature extraction layers
@@ -220,74 +219,99 @@ def main():
     download_training_data()
 
     # Load file paths and labels
-    audio_paths = []
-    audio_labels = []
+    all_audio_paths = []
+    all_audio_labels = []
     for root, _, files in os.walk(DOWNLOAD_DIR):
         for f in files:
             if f.endswith(".wav"):
-                audio_paths.append(os.path.join(root, f))
-                audio_labels.append(os.path.basename(root))
+                all_audio_paths.append(os.path.join(root, f))
+                all_audio_labels.append(os.path.basename(root))
 
-    if not audio_paths:
+    if not all_audio_paths:
         print("No audio files found for training. Please ensure 'user_training_data' in Firebase Storage contains .wav files in subdirectories (e.g., user_training_data/speaker1/audio.wav).")
         print("Training cannot proceed without data.")
         return
 
+    # --- NEW: Pre-filter problematic audio files here ---
+    valid_audio_paths = []
+    valid_audio_labels = []
+    target_length_samples = SAMPLE_RATE * DURATION
+
+    print("Pre-validating audio files...")
+    for i, path in enumerate(all_audio_paths):
+        try:
+            wav, sr = sf.read(path)
+            # Resample to target SR
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
+            
+            # Check if audio is too short after resampling
+            if len(wav) < target_length_samples:
+                # If it's too short, pad it. If it's still problematic after this,
+                # it's likely an unrecoverable issue with the file itself.
+                wav = np.pad(wav, (0, target_length_samples - len(wav)), 'constant')
+            elif len(wav) > target_length_samples:
+                wav = wav[:target_length_samples]
+
+            # Final check for valid size and non-zero content
+            if wav.size == target_length_samples and not np.all(wav == 0):
+                valid_audio_paths.append(path)
+                valid_audio_labels.append(all_audio_labels[i])
+            else:
+                print(f"Skipping problematic audio file (empty or all zeros after processing): {path}")
+
+        except Exception as e:
+            print(f"Skipping problematic audio file (error during read/resample): {path} - {e}")
+            continue
+
+    if not valid_audio_paths:
+        print("No valid audio files found after pre-validation. Training cannot proceed.")
+        return
+
     label_encoder = LabelEncoder()
-    encoded_labels = label_encoder.fit_transform(audio_labels)
+    encoded_labels = label_encoder.fit_transform(valid_audio_labels)
     global NUM_CLASSES
     NUM_CLASSES = len(label_encoder.classes_)
-    print(f"Found {len(audio_paths)} audio files across {NUM_CLASSES} classes.")
+    print(f"Found {len(valid_audio_paths)} valid audio files across {NUM_CLASSES} classes.")
 
     # Save class map
-    # Using 'json' module directly for saving
     with open("class_to_label.json", "w") as f:
         json.dump({str(i): label for i, label in enumerate(label_encoder.classes_)}, f)
     print("Class map saved to class_to_label.json")
 
     # Stratified split
     # Ensure there are enough samples for splitting (at least 2 per class for stratification)
-    if len(audio_paths) < 2 or (NUM_CLASSES > 1 and min(np.bincount(encoded_labels)) < 2):
-        print("Not enough samples per class for stratified split. Using non-stratified split or skipping validation.")
-        # Fallback to non-stratified if stratification is impossible
+    # Check if any class has less than 2 samples for stratification
+    label_counts = np.bincount(encoded_labels)
+    can_stratify = all(count >= 2 for count in label_counts) and len(valid_audio_paths) >= 2
+
+    if not can_stratify:
+        print("Not enough samples per class for stratified split or total samples < 2. Using non-stratified split.")
         X_train, X_val, y_train, y_val = train_test_split(
-            audio_paths, encoded_labels, test_size=0.2, random_state=42
+            valid_audio_paths, encoded_labels, test_size=0.2, random_state=42
         )
     else:
         X_train, X_val, y_train, y_val = train_test_split(
-            audio_paths, encoded_labels, test_size=0.2, stratify=encoded_labels, random_state=42
+            valid_audio_paths, encoded_labels, test_size=0.2, stratify=encoded_labels, random_state=42
         )
-
-    # --- NEW: Filter out potentially problematic samples from the dataset ---
-    # This requires a custom collate_fn for DataLoader if you want to remove them
-    # For simplicity, let's just make sure the dataset creation handles it.
-    # If a sample returns -1 as label due to invalid audio, we need to filter it out.
-    # A cleaner approach would be to filter X_train, X_val, y_train, y_val directly.
-    # For now, we'll rely on the warning and hope the model can handle a few problematic samples
-    # or that the fix_length and pad ensures valid input.
-    # The primary fix is to ensure `fix_length` and padding are correct.
-    # --- END NEW ---
 
     train_dataset = VoiceDataset(X_train, y_train, augment=True)
     val_dataset = VoiceDataset(X_val, y_val, augment=False)
 
-    # --- NEW: Custom collate_fn to filter out problematic samples if any were marked with label -1 ---
+    # Custom collate_fn to filter out problematic samples if any were marked with label -1
+    # (This is a fallback, primary filtering is now done in main)
     def custom_collate_fn(batch):
-        filtered_batch = [item for item in batch if item[1] != -1] # Filter out samples with dummy label -1
+        filtered_batch = [item for item in batch if item[1] != -1]
         if not filtered_batch:
-            # If all samples in a batch are invalid, return empty tensors or handle as error
-            # For now, return empty lists, DataLoader will likely raise an error if batch is empty
-            return [], []
+            # Return empty tensors of correct shape if batch is empty, to avoid DataLoader crash
+            # The model's forward pass will handle this empty tensor gracefully
+            return torch.empty(0, SAMPLE_RATE * DURATION).float(), torch.empty(0, dtype=torch.long)
         
-        # Default collate behavior for the filtered batch
         audios = torch.stack([item[0] for item in filtered_batch])
         labels = torch.tensor([item[1] for item in filtered_batch])
         return audios, labels
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate_fn)
-    # --- END NEW ---
-
 
     # Initialize model with the new TransferLearningCNN
     model = TransferLearningCNN(NUM_CLASSES).to(DEVICE)
@@ -303,11 +327,10 @@ def main():
         model.train()
         total_loss = 0
         for batch_idx, (x, y) in enumerate(train_loader):
-            # --- NEW: Skip empty batches from custom_collate_fn ---
-            if len(x) == 0:
-                print(f"  Skipping empty batch {batch_idx+1} in training.")
+            # Skip empty batches from custom_collate_fn
+            if x.numel() == 0: # Check if tensor is empty
+                print(f"  Skipping empty batch {batch_idx+1} in training (no valid samples).")
                 continue
-            # --- END NEW ---
 
             x, y = x.to(DEVICE), y.to(DEVICE)
             preds = model(x)
@@ -325,19 +348,19 @@ def main():
         model.eval()
         correct = total = 0
         with torch.no_grad():
-            for x, y in val_loader:
-                # --- NEW: Skip empty batches from custom_collate_fn ---
-                if len(x) == 0:
-                    print(f"  Skipping empty batch {batch_idx+1} in validation.")
+            for batch_idx_val, (x, y) in enumerate(val_loader): # Added batch_idx_val for clarity
+                # Skip empty batches from custom_collate_fn
+                if x.numel() == 0: # Check if tensor is empty
+                    print(f"  Skipping empty batch {batch_idx_val+1} in validation (no valid samples).")
                     continue
-                # --- END NEW ---
 
                 x, y = x.to(DEVICE), y.to(DEVICE)
                 preds = model(x)
                 correct += (preds.argmax(1) == y).sum().item()
                 total += y.size(0)
 
-        acc = correct / total
+        # Ensure total is not zero to avoid division by zero
+        acc = correct / total if total > 0 else 0.0
         print(f"Epoch {epoch+1} - Loss: {total_loss:.4f}, Val Acc: {acc:.4f}")
 
         if acc > best_val_acc:
