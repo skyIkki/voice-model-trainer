@@ -14,8 +14,8 @@ import soundfile as sf
 from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, Shift
 
 # --- CONFIGURATION ---
-BUCKET_NAME = "your-bucket-name.appspot.com"
-DOWNLOAD_DIR = "voice_training_data"
+BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
+DOWNLOAD_DIR = "user_training_data"
 SAMPLE_RATE = 16000
 DURATION = 3  # seconds
 NUM_CLASSES = 0
