@@ -191,17 +191,26 @@ class VoiceDataset(Dataset):
 class VGGishFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
-        # Load pre-trained VGGish model from PyTorch Hub
-        # This will download the repository to the cache if not present
-        # Note: torch.hub.load was already called globally at the top to ensure path setup.
-        self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
+        self.vggish = None # Initialize to None
+        try:
+            # Load pre-trained VGGish model from PyTorch Hub
+            # This will download the repository to the cache if not present
+            self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
 
-        # Set VGGish to evaluation mode (important for consistent feature extraction)
-        self.vggish.eval()
+            if self.vggish is None:
+                raise RuntimeError("torch.hub.load('harritaylor/pytorch-vggish', 'vggish') returned None.")
 
-        # Freeze VGGish parameters to use it as a fixed feature extractor
-        for param in self.vggish.parameters():
-            param.requires_grad = False
+            # Set VGGish to evaluation mode (important for consistent feature extraction)
+            self.vggish.eval()
+
+            # Freeze VGGish parameters to use it as a fixed feature extractor
+            for param in self.vggish.parameters():
+                param.requires_grad = False
+            print("DEBUG: VGGish model successfully loaded and configured.")
+
+        except Exception as e:
+            print(f"❌ CRITICAL ERROR: Failed to load or configure VGGish model in __init__: {type(e).__name__}: {e}")
+            # If VGGish loading fails, self.vggish remains None, and forward will handle it.
 
     def forward(self, x):
         # x is [batch_size, num_samples] (raw audio)
@@ -292,6 +301,11 @@ class VGGishFeatureExtractor(nn.Module):
         examples_batch = torch.from_numpy(examples_batch_np).to(x.device) # Use the potentially converted/fallback numpy array
 
         # --- Aggressive error handling for vggish.forward ---
+        # NEW: Check if self.vggish is valid before calling forward
+        if self.vggish is None:
+            print("❌ ERROR: VGGish model was not successfully loaded in __init__. Returning zero-filled embeddings.")
+            return torch.zeros(x.shape[0], 128).to(x.device)
+
         try:
             # self.vggish.forward already performs pooling to 128-dim per segment
             embeddings = self.vggish.forward(examples_batch) # Expected output: (total_num_segments, 128)
