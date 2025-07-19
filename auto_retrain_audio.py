@@ -153,14 +153,11 @@ class VGGishFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
         # Load pre-trained VGGish model from PyTorch Hub
-        # This will download the repository to the cache if not present
         self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
 
         # Ensure _vggish_input_module is loaded (it should be by _ensure_vggish_modules_loaded in main)
-        global _vggish_input_module
+        global _vggish_input_module, _vggish_params_module
         if _vggish_input_module is None:
-            # This case should ideally not be hit if _ensure_vggish_modules_loaded is called
-            # but as a fallback, try to load it here too.
             vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
             torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
             if torchvggish_path not in sys.path:
@@ -171,6 +168,12 @@ class VGGishFeatureExtractor(nn.Module):
             except ImportError as e:
                 raise ImportError(f"Failed to import vggish_input as fallback. Error: {e}")
 
+        if _vggish_params_module is None:
+            try:
+                from torchvggish import vggish_params as imported_vggish_params
+                _vggish_params_module = imported_vggish_params
+            except ImportError as e:
+                raise ImportError(f"Failed to import vggish_params. Error: {e}")
 
         # Set VGGish to evaluation mode (important for consistent feature extraction)
         self.vggish.eval()
@@ -180,34 +183,37 @@ class VGGishFeatureExtractor(nn.Module):
             param.requires_grad = False
 
     def forward(self, x):
-        # x is [batch_size, num_samples] (raw audio)
-        # We now explicitly preprocess the waveform to VGGish examples (Mel Spectrograms)
-        # This bypasses the problematic _preprocess method in vggish.py
-        # _vggish_input_module.waveform_to_examples expects a 1D numpy array or a 2D tensor [batch_size, samples]
-        # and returns [batch_size, num_frames, num_mels]
-
-        # Ensure _vggish_input_module is not None before using it
+        # x is [batch_size, num_samples]
         if _vggish_input_module is None:
-            raise RuntimeError("vggish_input_module was not successfully loaded. Check VGGishFeatureExtractor __init__ or _ensure_vggish_modules_loaded.")
+            raise RuntimeError("vggish_input_module was not successfully loaded.")
 
-        # Move tensor to CPU for numpy conversion, then back to device
-        # Ensure x is contiguous before converting to numpy
-        # Handle potential empty input from collate_fn if all samples in a batch were problematic
-        if x.numel() == 0: # Check if the tensor is empty
-            # Return a dummy tensor of the expected output shape if input is empty
-            # This prevents crashing but means this batch won't contribute to training
-            return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
+        if x.numel() == 0:
+            return torch.zeros(x.shape[0], 128).to(x.device)
 
-        examples_batch = _vggish_input_module.waveform_to_examples(x.cpu().contiguous().numpy(), SAMPLE_RATE)
-        examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
+        # Convert to numpy
+        batch_numpy = x.cpu().contiguous().numpy()
 
-        # Pass the preprocessed examples through VGGish's feature extraction layers
-        # The vggish model's forward method can take these examples directly
-        embeddings = self.vggish.forward(examples_batch) # Pass the preprocessed examples
+        # Minimum required length for VGGish framing
+        required_samples = int(_vggish_params_module.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
 
-        # Average pool the embeddings across the time segments
-        # This results in a single 128-dim embedding per audio clip
-        pooled_embeddings = torch.mean(embeddings, dim=1) # Output shape: [batch_size, 128]
+        # Pad short samples
+        padded_batch = []
+        for sample in batch_numpy:
+            if sample.shape[0] < required_samples:
+                pad_length = required_samples - sample.shape[0]
+                print(f"⚠️ Sample too short for VGGish framing. Padding from {sample.shape[0]} to {required_samples}")
+                sample = np.pad(sample, (0, pad_length), mode='constant')
+            padded_batch.append(sample)
+
+        # Convert to VGGish-compatible input
+        examples_batch = _vggish_input_module.waveform_to_examples(np.array(padded_batch), SAMPLE_RATE)
+        examples_batch = torch.from_numpy(examples_batch).to(x.device)
+
+        # Pass through VGGish
+        embeddings = self.vggish.forward(examples_batch)
+
+        # Average pool the embeddings across time
+        pooled_embeddings = torch.mean(embeddings, dim=1)  # Output: [batch_size, 128]
         return pooled_embeddings
 
 class TransferLearningCNN(nn.Module):
