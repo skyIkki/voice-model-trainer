@@ -202,13 +202,20 @@ class VGGishFeatureExtractor(nn.Module):
             return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
 
         # --- NEW: Explicitly cast to float32 and ensure 1D or 2D for waveform_to_examples ---
-        # waveform_to_examples expects (N,) or (B, N)
-        # Our x is (B, N) from DataLoader, so it should be fine.
-        # Ensure it's float32 as expected by vggish_input.
         numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
         
-        examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
+        # --- NEW: Debugging prints for numpy_wav ---
+        print(f"DEBUG: numpy_wav shape before waveform_to_examples: {numpy_wav.shape}")
+        print(f"DEBUG: numpy_wav dtype before waveform_to_examples: {numpy_wav.dtype}")
+        if numpy_wav.size > 0:
+            print(f"DEBUG: numpy_wav min/max/mean: {numpy_wav.min():.4f}/{numpy_wav.max():.4f}/{numpy_wav.mean():.4f}")
+            print(f"DEBUG: numpy_wav contains NaN: {np.isnan(numpy_wav).any()}")
+            print(f"DEBUG: numpy_wav contains Inf: {np.isinf(numpy_wav).any()}")
+        else:
+            print("DEBUG: numpy_wav is empty.")
         # --- END NEW ---
+
+        examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
 
         examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
 
