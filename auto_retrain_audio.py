@@ -251,24 +251,17 @@ class VGGishFeatureExtractor(nn.Module):
         try:
             temp_examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
             
-            # Explicitly convert to numpy array if it's a Tensor
+            # Explicitly convert to numpy array if it's a Tensor, detaching first
             if isinstance(temp_examples_batch, torch.Tensor):
-                print("DEBUG: vggish_input.waveform_to_examples returned a Tensor. Converting to NumPy array.")
-                examples_batch_np = temp_examples_batch.cpu().numpy()
+                print("DEBUG: vggish_input.waveform_to_examples returned a Tensor. Detaching and converting to NumPy array.")
+                examples_batch_np = temp_examples_batch.detach().cpu().numpy() # ADDED .detach()
             else:
                 examples_batch_np = temp_examples_batch # Already a NumPy array
 
-        except ValueError as e:
-            print(f"❌ ERROR: ValueError in vggish_input.waveform_to_examples: {e}")
+        except Exception as e: # Catch any unexpected errors, including ValueError
+            print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples: {e}")
             print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
-            # Fallback for examples_batch_np if ValueError occurs
-            num_frames_fallback = int((SAMPLE_RATE * DURATION - vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) / (vggish_params.STFT_HOP_LENGTH_SECONDS * SAMPLE_RATE)) + 1
-            if num_frames_fallback <= 0:
-                num_frames_fallback = 1
-            examples_batch_np = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
-        except Exception as e: # Catch any other unexpected errors
-            print(f"❌ UNEXPECTED ERROR in vggish_input.waveform_to_examples: {e}")
-            print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
+            # Fallback for examples_batch_np if any error occurs
             num_frames_fallback = int((SAMPLE_RATE * DURATION - vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) / (vggish_params.STFT_HOP_LENGTH_SECONDS * SAMPLE_RATE)) + 1
             if num_frames_fallback <= 0:
                 num_frames_fallback = 1
