@@ -140,7 +140,7 @@ class VoiceDataset(Dataset):
         try:
             read_wav, sr = sf.read(path)
             
-            # If read_wav is empty or invalid, proceed with the zero-initialized 'wav'
+            # If read_wav is None or empty, proceed with the zero-initialized 'wav'
             if read_wav is None or read_wav.size == 0:
                 print(f"⚠️ Warning: Audio file {path} is empty after sf.read. Using zero-padded array.")
             else:
@@ -247,7 +247,7 @@ class VGGishFeatureExtractor(nn.Module):
         else:
             print("DEBUG: vggish_params module not loaded, cannot print internal VGGish parameters.")
 
-        # --- NEW: Aggressive error handling for waveform_to_examples and type conversion ---
+        # --- Aggressive error handling for waveform_to_examples and type conversion ---
         try:
             temp_examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
             
@@ -258,31 +258,42 @@ class VGGishFeatureExtractor(nn.Module):
             else:
                 examples_batch_np = temp_examples_batch # Already a NumPy array
 
-            # --- NEW: Debugging prints for examples_batch_np ---
-            print(f"DEBUG: examples_batch_np shape after conversion: {examples_batch_np.shape}")
-            print(f"DEBUG: examples_batch_np dtype after conversion: {examples_batch_np.dtype}")
+            # --- NEW: Squeeze out the problematic dimension if it exists and is 1 ---
+            # This is the crucial fix for the (X, 1, 96, 64) -> (X, 96, 64) problem
+            if examples_batch_np.ndim == 4 and examples_batch_np.shape[1] == 1:
+                print(f"DEBUG: Squeezing problematic dimension from examples_batch_np. Shape before: {examples_batch_np.shape}")
+                examples_batch_np = np.squeeze(examples_batch_np, axis=1)
+                print(f"DEBUG: Shape after squeezing: {examples_batch_np.shape}")
+            # --- END NEW ---
+
+            # Debugging prints for examples_batch_np
+            print(f"DEBUG: examples_batch_np shape after conversion and squeeze: {examples_batch_np.shape}")
+            print(f"DEBUG: examples_batch_np dtype after conversion and squeeze: {examples_batch_np.dtype}")
             if examples_batch_np.size > 0:
                 print(f"DEBUG: examples_batch_np min/max/mean: {examples_batch_np.min():.4f}/{examples_batch_np.max():.4f}/{examples_batch_np.mean():.4f}")
                 print(f"DEBUG: examples_batch_np contains NaN: {np.isnan(examples_batch_np).any()}")
                 print(f"DEBUG: examples_batch_np contains Inf: {np.isinf(examples_batch_np).any()}")
             else:
                 print("DEBUG: examples_batch_np is empty.")
-            # --- END NEW ---
 
         except Exception as e: # Catch any unexpected errors, including ValueError
-            print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples: {e}")
+            print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples (or subsequent squeeze): {e}")
             print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
             # Fallback for examples_batch_np if any error occurs
-            num_frames_fallback = int((SAMPLE_RATE * DURATION - vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) / (vggish_params.STFT_HOP_LENGTH_SECONDS * SAMPLE_RATE)) + 1
+            # We need to ensure vggish_params is available for this fallback.
+            stft_window_len_s = vggish_params.STFT_WINDOW_LENGTH_SECONDS if vggish_params else 0.025
+            stft_hop_len_s = vggish_params.STFT_HOP_LENGTH_SECONDS if vggish_params else 0.01
+            
+            num_frames_fallback = int((SAMPLE_RATE * DURATION - stft_window_len_s * SAMPLE_RATE) / (stft_hop_len_s * SAMPLE_RATE)) + 1
             if num_frames_fallback <= 0:
                 num_frames_fallback = 1
             examples_batch_np = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
 
-        # --- END NEW ---
+        # --- END Aggressive error handling ---
 
         examples_batch = torch.from_numpy(examples_batch_np).to(x.device) # Use the potentially converted/fallback numpy array
 
-        # --- NEW: Aggressive error handling for vggish.forward ---
+        # --- Aggressive error handling for vggish.forward ---
         try:
             embeddings = self.vggish.forward(examples_batch) # Pass the preprocessed examples
         except Exception as e:
@@ -290,7 +301,7 @@ class VGGishFeatureExtractor(nn.Module):
             print("Returning zero-filled embeddings to prevent crash.")
             embeddings = torch.zeros(examples_batch.shape[0], 128).to(x.device) # Fallback
 
-        # --- END NEW ---
+        # --- END Aggressive error handling ---
 
         # Average pool the embeddings across the time segments
         # This results in a single 128-dim embedding per audio clip
