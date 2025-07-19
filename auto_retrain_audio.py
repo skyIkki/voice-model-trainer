@@ -258,6 +258,17 @@ class VGGishFeatureExtractor(nn.Module):
             else:
                 examples_batch_np = temp_examples_batch # Already a NumPy array
 
+            # --- NEW: Debugging prints for examples_batch_np ---
+            print(f"DEBUG: examples_batch_np shape after conversion: {examples_batch_np.shape}")
+            print(f"DEBUG: examples_batch_np dtype after conversion: {examples_batch_np.dtype}")
+            if examples_batch_np.size > 0:
+                print(f"DEBUG: examples_batch_np min/max/mean: {examples_batch_np.min():.4f}/{examples_batch_np.max():.4f}/{examples_batch_np.mean():.4f}")
+                print(f"DEBUG: examples_batch_np contains NaN: {np.isnan(examples_batch_np).any()}")
+                print(f"DEBUG: examples_batch_np contains Inf: {np.isinf(examples_batch_np).any()}")
+            else:
+                print("DEBUG: examples_batch_np is empty.")
+            # --- END NEW ---
+
         except Exception as e: # Catch any unexpected errors, including ValueError
             print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples: {e}")
             print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
@@ -271,9 +282,15 @@ class VGGishFeatureExtractor(nn.Module):
 
         examples_batch = torch.from_numpy(examples_batch_np).to(x.device) # Use the potentially converted/fallback numpy array
 
-        # Pass the preprocessed examples through VGGish's feature extraction layers
-        # The vggish model's forward method can take these examples directly
-        embeddings = self.vggish.forward(examples_batch) # Pass the preprocessed examples
+        # --- NEW: Aggressive error handling for vggish.forward ---
+        try:
+            embeddings = self.vggish.forward(examples_batch) # Pass the preprocessed examples
+        except Exception as e:
+            print(f"❌ ERROR: Exception during self.vggish.forward: {e}")
+            print("Returning zero-filled embeddings to prevent crash.")
+            embeddings = torch.zeros(examples_batch.shape[0], 128).to(x.device) # Fallback
+
+        # --- END NEW ---
 
         # Average pool the embeddings across the time segments
         # This results in a single 128-dim embedding per audio clip
