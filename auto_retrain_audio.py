@@ -18,10 +18,8 @@ import json # Import json for saving class map
 import sys
 import torch.hub
 
-# Placeholder for the vggish_input and vggish_params modules
-# These will be populated by _ensure_vggish_modules_loaded()
+# Placeholder for the vggish_input module, will be loaded dynamically
 _vggish_input_module = None
-_vggish_params_module = None
 # --- END NEW ---
 
 # --- CONFIGURATION ---
@@ -152,69 +150,63 @@ class VoiceDataset(Dataset):
 class VGGishFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
+        # Load pre-trained VGGish model from PyTorch Hub
+        # This will download the repository to the cache if not present
         self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
-        global _vggish_input_module, _vggish_params_module
-        if _vggish_input_module is None:
+
+        # --- Dynamically add the torchvggish path to sys.path and import vggish_input ---
+        global _vggish_input_module # Access the global placeholder
+        if _vggish_input_module is None: # Only import once
+            # Get the path where torch.hub.load cloned the repo
             vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
             torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
             if torchvggish_path not in sys.path:
-                sys.path.insert(0, torchvggish_path)
-            from torchvggish import vggish_input as imported_vggish_input
-            _vggish_input_module = imported_vggish_input
+                sys.path.insert(0, torchvggish_path) # Add to path
+            try:
+                # Import with alias and assign to global placeholder
+                from torchvggish import vggish_input as imported_vggish_input
+                _vggish_input_module = imported_vggish_input
+            except ImportError as e:
+                raise ImportError(f"Failed to import vggish_input from {torchvggish_path}. Error: {e}")
+        # --- END NEW ---
 
-        if _vggish_params_module is None:
-            from torchvggish import vggish_params as imported_vggish_params
-            _vggish_params_module = imported_vggish_params
-
+        # Set VGGish to evaluation mode (important for consistent feature extraction)
         self.vggish.eval()
+
+        # Freeze VGGish parameters to use it as a fixed feature extractor
         for param in self.vggish.parameters():
             param.requires_grad = False
 
     def forward(self, x):
-    if _vggish_input_module is None:
-        raise RuntimeError("vggish_input_module not loaded")
-    if x.numel() == 0:
-        return torch.zeros(x.shape[0], 128).to(x.device)
+        # x is [batch_size, num_samples] (raw audio)
+        # We now explicitly preprocess the waveform to VGGish examples (Mel Spectrograms)
+        # This bypasses the problematic _preprocess method in vggish.py
+        # _vggish_input_module.waveform_to_examples expects a 1D numpy array or a 2D tensor [batch_size, samples]
+        # and returns [batch_size, num_frames, num_mels]
 
-    batch_numpy = x.cpu().contiguous().numpy()
+        # Ensure _vggish_input_module is not None before using it
+        if _vggish_input_module is None:
+            raise RuntimeError("vggish_input_module was not successfully loaded. Check VGGishFeatureExtractor __init__.")
 
-    # VGGish STFT config
-    window_length = int(SAMPLE_RATE * _vggish_params_module.STFT_WINDOW_LENGTH_SECONDS)  # 400
-    hop_length = int(SAMPLE_RATE * _vggish_params_module.STFT_HOP_LENGTH_SECONDS)        # 160
-    min_frames = 1
-    min_required_samples = window_length + (min_frames - 1) * hop_length  # minimum for at least 1 frame
+        # Move tensor to CPU for numpy conversion, then back to device
+        # Ensure x is contiguous before converting to numpy
+        # Handle potential empty input from collate_fn if all samples in a batch were problematic
+        if x.numel() == 0: # Check if the tensor is empty
+            # Return a dummy tensor of the expected output shape if input is empty
+            # This prevents crashing but means this batch won't contribute to training
+            return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
 
-    padded_batch = []
-    for idx, sample in enumerate(batch_numpy):
-        if sample.shape[0] < min_required_samples:
-            pad_len = min_required_samples - sample.shape[0]
-            print(f"⚠️ Padding sample {idx} from {sample.shape[0]} to {min_required_samples}")
-            sample = np.pad(sample, (0, pad_len), mode='constant')
+        examples_batch = _vggish_input_module.waveform_to_examples(x.cpu().contiguous().numpy(), SAMPLE_RATE)
+        examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
 
-        # Double check length is valid after padding
-        total_frames = 1 + (len(sample) - window_length) // hop_length
-        if total_frames <= 0:
-            print(f"❌ Skipping sample {idx}: not enough data to compute even one frame after padding.")
-            continue
+        # Pass the preprocessed examples through VGGish's feature extraction layers
+        # The vggish model's forward method can take these examples directly
+        embeddings = self.vggish.forward(examples_batch) # Pass the preprocessed examples
 
-        padded_batch.append(sample)
-
-    if not padded_batch:
-        print("❌ All samples were too short — returning empty embedding tensor.")
-        return torch.zeros(x.shape[0], 128).to(x.device)
-
-    try:
-        examples_batch = _vggish_input_module.waveform_to_examples(np.array(padded_batch), SAMPLE_RATE)
-    except Exception as e:
-        print(f"❌ Failed in waveform_to_examples: {e}")
-        return torch.zeros(x.shape[0], 128).to(x.device)
-
-    examples_batch = torch.from_numpy(examples_batch).to(x.device)
-    embeddings = self.vggish.forward(examples_batch)
-    pooled_embeddings = torch.mean(embeddings, dim=1)
-    return pooled_embeddings
-
-
+        # Average pool the embeddings across the time segments
+        # This results in a single 128-dim embedding per audio clip
+        pooled_embeddings = torch.mean(embeddings, dim=1) # Output shape: [batch_size, 128]
+        return pooled_embeddings
 
 class TransferLearningCNN(nn.Module):
     def __init__(self, num_classes):
@@ -239,43 +231,8 @@ class TransferLearningCNN(nn.Module):
         output = self.classifier(features)
         return output
 
-# --- NEW HELPER FUNCTION TO ENSURE VGGISH MODULES ARE LOADED ---
-def _ensure_vggish_modules_loaded():
-    """
-    Ensures the vggish_input and vggish_params modules are loaded and accessible
-    by dynamically adding their path to sys.path after torch.hub.load.
-    This function should be called ONCE at the beginning of main().
-    """
-    global _vggish_input_module, _vggish_params_module
-
-    if _vggish_input_module is None or _vggish_params_module is None:
-        # Call torch.hub.load to ensure the repository is cloned and cached
-        # We don't need to store the model instance here, just ensure it's downloaded
-        print("Ensuring VGGish repository is loaded via torch.hub.load...")
-        _ = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', verbose=False) # verbose=False to reduce output
-
-        vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
-        torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
-
-        if torchvggish_path not in sys.path:
-            sys.path.insert(0, torchvggish_path)
-            print(f"Added {torchvggish_path} to sys.path.")
-
-        try:
-            from torchvggish import vggish_input as imported_vggish_input
-            from torchvggish import vggish_params as imported_vggish_params
-            _vggish_input_module = imported_vggish_input
-            _vggish_params_module = imported_vggish_params
-            print("Successfully loaded vggish_input and vggish_params.")
-        except ImportError as e:
-            raise ImportError(f"Critical: Failed to load vggish_input or vggish_params after adding path. Error: {e}")
-
 # --- MAIN TRAINING ---
 def main():
-    # --- NEW: Ensure VGGish modules are loaded at the very beginning ---
-    _ensure_vggish_modules_loaded()
-    # --- END NEW ---
-
     download_training_data()
 
     # Load file paths and labels
@@ -292,34 +249,31 @@ def main():
         print("Training cannot proceed without data.")
         return
 
-    # --- Pre-filter problematic audio files here ---
+    # --- NEW: Pre-filter problematic audio files here ---
     valid_audio_paths = []
     valid_audio_labels = []
     target_length_samples = SAMPLE_RATE * DURATION
-
-    # Use the loaded _vggish_params_module for min_vggish_input_samples
-    if _vggish_params_module is not None:
-        min_vggish_input_samples = int(_vggish_params_module.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
-    else:
-        # Fallback if _vggish_params_module somehow still failed to load
-        print("Warning: _vggish_params_module not loaded. Using default min_vggish_input_samples.")
-        min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds
-
 
     print("Pre-validating audio files...")
     for i, path in enumerate(all_audio_paths):
         try:
             # Attempt to read and resample to ensure it's a valid audio file
             wav_check, sr_check = sf.read(path)
-            if wav_check is None or wav_check.size == 0: # Check for None or empty array
+            if wav_check.size == 0:
                 print(f"Skipping empty audio file: {path}")
                 continue
             
             resampled_wav_check = librosa.resample(wav_check, orig_sr=sr_check, target_sr=SAMPLE_RATE)
             
-            # Check if the resampled audio is still too short for VGGish's internal framing
+            # Check if the resampled audio is still too short or problematic for VGGish's internal framing
+            # VGGish's internal frame size is vggish_params.STFT_WINDOW_LENGTH_SECONDS * vggish_params.SAMPLE_RATE
+            # which is 0.025 * 16000 = 400 samples.
+            # A minimum length is required to form even one frame.
+            # Let's assume a minimum of at least one frame length for robust processing.
+            min_vggish_input_samples = int(vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) # 400 samples
+
             if len(resampled_wav_check) < min_vggish_input_samples:
-                print(f"Skipping audio file too short for VGGish framing ({len(resampled_wav_check)} samples, min needed {min_vggish_input_samples}): {path}")
+                print(f"Skipping audio file too short for VGGish framing ({len(resampled_wav_check)} samples): {path}")
                 continue
 
             # If it passes these checks, it's considered valid for inclusion
@@ -366,16 +320,9 @@ def main():
 
     # Custom collate_fn (simplified as __getitem__ always returns valid data)
     def custom_collate_fn(batch):
-        # Filter out any samples that were returned as dummy data (label -1) from VoiceDataset
-        # This is a safeguard if __getitem__ failed to process a file even after pre-validation.
-        filtered_batch = [item for item in batch if item[1] != -1]
-        
-        if not filtered_batch:
-            # Return empty tensors of correct shape if batch is empty, to avoid DataLoader crash
-            return torch.empty(0, SAMPLE_RATE * DURATION).float(), torch.empty(0, dtype=torch.long)
-        
-        audios = torch.stack([item[0] for item in filtered_batch])
-        labels = torch.tensor([item[1] for item in filtered_batch])
+        # Batch is guaranteed to have valid items from VoiceDataset
+        audios = torch.stack([item[0] for item in batch])
+        labels = torch.tensor([item[1] for item in batch])
         return audios, labels
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn)
@@ -395,7 +342,7 @@ def main():
         model.train()
         total_loss = 0
         for batch_idx, (x, y) in enumerate(train_loader):
-            # Skip empty batches from custom_collate_fn
+            # Skip empty batches from custom_collate_fn if any
             if x.numel() == 0: # Check if tensor is empty
                 print(f"  Skipping empty batch {batch_idx+1} in training (no valid samples).")
                 continue
@@ -417,7 +364,7 @@ def main():
         correct = total = 0
         with torch.no_grad():
             for batch_idx_val, (x, y) in enumerate(val_loader): # Added batch_idx_val for clarity
-                # Skip empty batches from custom_collate_fn
+                # Skip empty batches from custom_collate_fn if any
                 if x.numel() == 0: # Check if tensor is empty
                     print(f"  Skipping empty batch {batch_idx_val+1} in validation (no valid samples).")
                     continue
