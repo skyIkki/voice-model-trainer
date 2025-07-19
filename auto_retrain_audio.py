@@ -18,9 +18,9 @@ import json # Import json for saving class map
 import sys
 import torch.hub
 
-# Placeholder for the vggish_input module, will be loaded dynamically
+# Placeholder for the vggish_input and vggish_params modules
+# These will be populated by _ensure_vggish_modules_loaded()
 _vggish_input_module = None
-# Placeholder for vggish_params module, will be loaded dynamically for pre-validation
 _vggish_params_module = None
 # --- END NEW ---
 
@@ -156,21 +156,21 @@ class VGGishFeatureExtractor(nn.Module):
         # This will download the repository to the cache if not present
         self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
 
-        # --- Dynamically add the torchvggish path to sys.path and import vggish_input ---
-        global _vggish_input_module # Access the global placeholder
-        if _vggish_input_module is None: # Only import once
-            # Get the path where torch.hub.load cloned the repo
+        # Ensure _vggish_input_module is loaded (it should be by _ensure_vggish_modules_loaded in main)
+        global _vggish_input_module
+        if _vggish_input_module is None:
+            # This case should ideally not be hit if _ensure_vggish_modules_loaded is called
+            # but as a fallback, try to load it here too.
             vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
             torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
             if torchvggish_path not in sys.path:
-                sys.path.insert(0, torchvggish_path) # Add to path
+                sys.path.insert(0, torchvggish_path)
             try:
-                # Import with alias and assign to global placeholder
                 from torchvggish import vggish_input as imported_vggish_input
                 _vggish_input_module = imported_vggish_input
             except ImportError as e:
-                raise ImportError(f"Failed to import vggish_input from {torchvggish_path}. Error: {e}")
-        # --- END NEW ---
+                raise ImportError(f"Failed to import vggish_input as fallback. Error: {e}")
+
 
         # Set VGGish to evaluation mode (important for consistent feature extraction)
         self.vggish.eval()
@@ -188,7 +188,7 @@ class VGGishFeatureExtractor(nn.Module):
 
         # Ensure _vggish_input_module is not None before using it
         if _vggish_input_module is None:
-            raise RuntimeError("vggish_input_module was not successfully loaded. Check VGGishFeatureExtractor __init__.")
+            raise RuntimeError("vggish_input_module was not successfully loaded. Check VGGishFeatureExtractor __init__ or _ensure_vggish_modules_loaded.")
 
         # Move tensor to CPU for numpy conversion, then back to device
         # Ensure x is contiguous before converting to numpy
@@ -233,8 +233,43 @@ class TransferLearningCNN(nn.Module):
         output = self.classifier(features)
         return output
 
+# --- NEW HELPER FUNCTION TO ENSURE VGGISH MODULES ARE LOADED ---
+def _ensure_vggish_modules_loaded():
+    """
+    Ensures the vggish_input and vggish_params modules are loaded and accessible
+    by dynamically adding their path to sys.path after torch.hub.load.
+    This function should be called ONCE at the beginning of main().
+    """
+    global _vggish_input_module, _vggish_params_module
+
+    if _vggish_input_module is None or _vggish_params_module is None:
+        # Call torch.hub.load to ensure the repository is cloned and cached
+        # We don't need to store the model instance here, just ensure it's downloaded
+        print("Ensuring VGGish repository is loaded via torch.hub.load...")
+        _ = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', verbose=False) # verbose=False to reduce output
+
+        vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
+        torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
+
+        if torchvggish_path not in sys.path:
+            sys.path.insert(0, torchvggish_path)
+            print(f"Added {torchvggish_path} to sys.path.")
+
+        try:
+            from torchvggish import vggish_input as imported_vggish_input
+            from torchvggish import vggish_params as imported_vggish_params
+            _vggish_input_module = imported_vggish_input
+            _vggish_params_module = imported_vggish_params
+            print("Successfully loaded vggish_input and vggish_params.")
+        except ImportError as e:
+            raise ImportError(f"Critical: Failed to load vggish_input or vggish_params after adding path. Error: {e}")
+
 # --- MAIN TRAINING ---
 def main():
+    # --- NEW: Ensure VGGish modules are loaded at the very beginning ---
+    _ensure_vggish_modules_loaded()
+    # --- END NEW ---
+
     download_training_data()
 
     # Load file paths and labels
@@ -251,32 +286,18 @@ def main():
         print("Training cannot proceed without data.")
         return
 
-    # --- NEW: Pre-filter problematic audio files here ---
+    # --- Pre-filter problematic audio files here ---
     valid_audio_paths = []
     valid_audio_labels = []
     target_length_samples = SAMPLE_RATE * DURATION
 
-    # --- NEW: Temporarily load vggish_params for pre-validation ---
-    global _vggish_params_module
-    if _vggish_params_module is None:
-        vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
-        torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
-        if torchvggish_path not in sys.path:
-            sys.path.insert(0, torchvggish_path)
-        try:
-            from torchvggish import vggish_params as imported_vggish_params
-            _vggish_params_module = imported_vggish_params
-        except ImportError as e:
-            print(f"Warning: Could not import vggish_params for pre-validation. Skipping VGGish-specific length check. Error: {e}")
-            # Set a default minimal length if vggish_params cannot be loaded
-            min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds
-    
-    # Use the loaded module or fallback default
+    # Use the loaded _vggish_params_module for min_vggish_input_samples
     if _vggish_params_module is not None:
         min_vggish_input_samples = int(_vggish_params_module.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
     else:
-        min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds if module not loaded
-    # --- END NEW ---
+        # Fallback if _vggish_params_module somehow still failed to load
+        print("Warning: _vggish_params_module not loaded. Using default min_vggish_input_samples.")
+        min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds
 
 
     print("Pre-validating audio files...")
