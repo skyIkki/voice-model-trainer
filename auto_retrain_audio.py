@@ -167,7 +167,21 @@ class VoiceDataset(Dataset):
 
         # Apply augmentation to the (potentially zero-padded) waveform
         if self.augment:
+            # Check dtype before augmentation if it's float64
+            if wav.dtype == np.float64:
+                print(f"DEBUG: Converting audio from float64 to float32 before augmentation for {path}")
+                wav = wav.astype(np.float32)
             wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
+
+        # Debugging prints for wav after all processing in __getitem__
+        print(f"DEBUG: __getitem__ output wav shape: {wav.shape}")
+        print(f"DEBUG: __getitem__ output wav dtype: {wav.dtype}")
+        if wav.size > 0:
+            print(f"DEBUG: __getitem__ output wav min/max/mean: {wav.min():.4f}/{wav.max():.4f}/{wav.mean():.4f}")
+            print(f"DEBUG: __getitem__ output wav contains NaN: {np.isnan(wav).any()}")
+            print(f"DEBUG: __getitem__ output wav contains Inf: {np.isinf(wav).any()}")
+        else:
+            print("DEBUG: __getitem__ output wav is empty.")
 
         # Convert to tensor. Label is always valid as it comes from pre-filtered list.
         return torch.tensor(wav).float(), label
@@ -208,14 +222,14 @@ class VGGishFeatureExtractor(nn.Module):
             # This prevents crashing but means this batch won't contribute to training
             return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
 
-        # --- NEW: Explicitly cast to float32 and ensure 1D or 2D for waveform_to_examples ---
+        # Explicitly cast to float32 and ensure 1D or 2D for waveform_to_examples
         # If batch size is 1, flatten to 1D array as waveform_to_examples can take (N,) or (B, N)
         if x.dim() == 2 and x.shape[0] == 1:
             numpy_wav = x.cpu().contiguous().numpy().flatten().astype(np.float32)
         else:
             numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
         
-        # --- NEW: Debugging prints for numpy_wav and VGGish parameters ---
+        # Debugging prints for numpy_wav and VGGish parameters
         print(f"DEBUG: Input to VGGishFeatureExtractor.forward: x.shape={x.shape}, x.dtype={x.dtype}")
         print(f"DEBUG: numpy_wav shape before waveform_to_examples: {numpy_wav.shape}")
         print(f"DEBUG: numpy_wav dtype before waveform_to_examples: {numpy_wav.dtype}")
@@ -232,9 +246,40 @@ class VGGishFeatureExtractor(nn.Module):
             print(f"DEBUG: VGGish Params - SAMPLE_RATE: {vggish_params.SAMPLE_RATE}")
         else:
             print("DEBUG: vggish_params module not loaded, cannot print internal VGGish parameters.")
-        # --- END NEW ---
 
-        examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
+        # --- NEW: Aggressive error handling for waveform_to_examples ---
+        try:
+            examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
+        except ValueError as e:
+            print(f"❌ ERROR: ValueError in vggish_input.waveform_to_examples: {e}")
+            print("Returning zero-filled examples_batch to prevent crash.")
+            # Calculate expected examples_batch shape for a 3-second audio (48000 samples)
+            # VGGish produces roughly 1 frame per 0.01 seconds (hop length)
+            # So, 3 seconds / 0.01 seconds/frame = 300 frames.
+            # Each frame has 96 mel bins.
+            # And VGGish outputs 128-dim embeddings.
+            # A rough estimate for examples_batch shape: [batch_size, num_frames, num_mels]
+            # num_frames = (SAMPLE_RATE * DURATION - STFT_WINDOW_LENGTH_SAMPLES) / STFT_HOP_LENGTH_SAMPLES + 1
+            # num_frames = (48000 - 400) / 160 + 1 = 297.5 + 1 = 298.5 -> 298 frames
+            # num_mels is 64 for VGGish mel_features
+            # Let's use a fixed shape that matches VGGish's output before pooling
+            # This is a placeholder, actual shape depends on VGGish internal parameters
+            # For a 3-second clip at 16kHz, VGGish generates ~298 frames of 64 mel bins.
+            # The actual output of waveform_to_examples is (num_examples, num_frames, num_mel_bins)
+            # where num_examples is the batch size.
+            # Let's assume a default reasonable number of frames, e.g., 300 frames, 64 mel bins.
+            # This is a hacky fallback, but it's to prevent the crash.
+            num_frames_fallback = int((SAMPLE_RATE * DURATION - vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) / (vggish_params.STFT_HOP_LENGTH_SECONDS * SAMPLE_RATE)) + 1
+            if num_frames_fallback <= 0: # Ensure it's at least 1 frame
+                num_frames_fallback = 1
+            
+            # The output of waveform_to_examples is typically (num_batches, num_frames, num_mel_bins)
+            # where num_mel_bins is 64 for VGGish.
+            examples_batch = np.zeros((numpy_wav.shape[0] if numpy_wav.ndim > 1 else 1, num_frames_fallback, 64), dtype=np.float32)
+            # If numpy_wav was 1D, its shape[0] is the length, so we need to use x.shape[0] (batch size)
+            examples_batch = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
+
+        # --- END NEW ---
 
         examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
 
