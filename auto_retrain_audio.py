@@ -275,7 +275,7 @@ class VGGishFeatureExtractor(nn.Module):
                 print("DEBUG: examples_batch_np is empty.")
 
         except Exception as e: # Catch any unexpected errors, including ValueError
-            print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples (or subsequent squeeze): {e}")
+            print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples (or subsequent squeeze): {type(e).__name__}: {e}")
             print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
             # Fallback for examples_batch_np if any error occurs
             # We need to ensure vggish_params is available for this fallback.
@@ -320,7 +320,7 @@ class VGGishFeatureExtractor(nn.Module):
                 reshaped_embeddings = embeddings.view(x.shape[0], num_segments_per_audio, 128)
                 print(f"DEBUG: Reshaped embeddings shape: {reshaped_embeddings.shape}")
             except RuntimeError as e:
-                print(f"❌ CRITICAL ERROR: RuntimeError during reshape of embeddings: {e}")
+                print(f"❌ CRITICAL ERROR: RuntimeError during reshape of embeddings: {type(e).__name__}: {e}")
                 print(f"   Attempting to reshape embeddings.shape={embeddings.shape} to ({x.shape[0]}, {num_segments_per_audio}, 128)")
                 # Fallback to zero-filled if reshape fails
                 return torch.zeros(x.shape[0], 128).to(x.device)
@@ -330,7 +330,8 @@ class VGGishFeatureExtractor(nn.Module):
             print(f"DEBUG: Pooled embeddings shape: {pooled_embeddings.shape}")
 
         except Exception as e:
-            print(f"❌ ERROR: Exception during self.vggish.forward or subsequent pooling: {e}")
+            # Print the type and message of the exception for better debugging
+            print(f"❌ ERROR: Exception during self.vggish.forward or subsequent pooling: {type(e).__name__}: {e}")
             print("Returning zero-filled embeddings to prevent crash.")
             pooled_embeddings = torch.zeros(x.shape[0], 128).to(x.device) # Fallback
 
