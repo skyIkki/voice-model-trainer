@@ -15,21 +15,6 @@ from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, 
 import json # Import json for saving class map
 import sys # Import sys for path manipulation
 
-# --- CRITICAL: Ensure VGGish related modules are loaded globally and early ---
-# We still load the VGGish model from torch.hub for its pre-trained weights,
-# but we will replace its internal preprocessing with our custom one.
-try:
-    print("Ensuring VGGish repository is cloned to torch.hub cache...")
-    # Use a dummy variable for the model as we just need the side effect of cloning
-    _ = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', verbose=False)
-    print("VGGish repository successfully cloned/found in cache.")
-
-except Exception as e:
-    print(f"❌ CRITICAL ERROR: Failed to clone VGGish repository via torch.hub. Training will likely fail. Error: {e}")
-
-# --- END CRITICAL GLOBAL IMPORT BLOCK ---
-
-
 # --- CONFIGURATION ---
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
 DOWNLOAD_DIR = "user_training_data"
@@ -66,8 +51,6 @@ augment = Compose([
 ])
 
 # --- INITIALIZE FIREBASE ---
-# Note: In a real GitHub Actions environment, 'firebase_key.json' is created by the workflow.
-# For local testing, ensure firebase_key.json is present or mock firebase_admin.
 try:
     cred = credentials.Certificate("firebase_key.json")
     firebase_admin.initialize_app(cred, {
@@ -76,14 +59,10 @@ try:
     bucket = storage.bucket()
 except ValueError:
     print("Firebase app already initialized or firebase_key.json not found. Skipping initialization.")
-    # This block handles cases where the app might be initialized elsewhere or key is missing for local dev.
-    # In GitHub Actions, the key will always be created.
 except FileNotFoundError:
     print("firebase_key.json not found. Ensure it's in the root directory for local testing.")
-    # For GitHub Actions, this file is created by the workflow.
 
 def download_training_data():
-    # Only import shutil if needed, to avoid potential import errors if not present
     try:
         import shutil
         if os.path.exists(DOWNLOAD_DIR):
@@ -94,7 +73,6 @@ def download_training_data():
         print("Shutil not available, skipping directory cleanup. Ensure directory is empty.")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    # Mock bucket for local testing if Firebase isn't fully set up
     if 'bucket' not in globals() or bucket is None:
         print("Firebase bucket not initialized. Skipping data download.")
         return
@@ -104,9 +82,8 @@ def download_training_data():
     downloaded_count = 0
     for blob in blobs:
         if blob.name.endswith(".wav"):
-            # Construct local path, skipping the 'user_training_data/' prefix
             local_path_parts = blob.name.split("/")[1:]
-            if not local_path_parts: # Handle case where blob name is just "user_training_data/"
+            if not local_path_parts:
                 continue
             local_path = os.path.join(DOWNLOAD_DIR, *local_path_parts)
             os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -116,24 +93,21 @@ def download_training_data():
     if downloaded_count == 0:
         print(f"⚠️ No .wav files found in '{DOWNLOAD_DIR}' prefix in Firebase Storage.")
 
-# --- NEW: Custom VGGish-style waveform to examples function ---
+# --- Custom VGGish-style waveform to examples function ---
 def custom_waveform_to_examples(data, sample_rate):
     """
     Converts audio waveform into a sequence of log-Mel spectrogram examples,
     compatible with VGGish input requirements.
-    This replaces torchvggish.vggish_input.waveform_to_examples.
     """
     if data.ndim == 1:
         # Single audio waveform, reshape to (1, num_samples) for consistent batching
         data = np.expand_dims(data, 0)
     
-    # Ensure data is float32
     data = data.astype(np.float32)
 
     all_examples = []
     for waveform in data:
         # 1. Compute STFT magnitude spectrogram
-        # Use n_fft and hop_length that match VGGish's window and hop sizes
         n_fft = VGGISH_STFT_WINDOW_LENGTH_SAMPLES
         hop_length = VGGISH_STFT_HOP_LENGTH_SAMPLES
 
@@ -141,7 +115,6 @@ def custom_waveform_to_examples(data, sample_rate):
         if len(waveform) < n_fft:
             waveform = np.pad(waveform, (0, n_fft - len(waveform)), mode='constant')
 
-        # Compute Mel spectrogram
         mel_spectrogram = librosa.feature.melspectrogram(
             y=waveform,
             sr=sample_rate,
@@ -150,77 +123,100 @@ def custom_waveform_to_examples(data, sample_rate):
             n_mels=VGGISH_MEL_BINS,
             fmin=VGGISH_MEL_MIN_HZ,
             fmax=VGGISH_MEL_MAX_HZ,
-            power=1.0 # Use power=1.0 for magnitude spectrogram, then convert to dB
+            power=1.0
         )
 
-        # Convert to log scale (dB)
-        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=1.0, top_db=None) # VGGish uses top_db=None
-
-        # VGGish expects frames as (num_frames, num_mel_bins)
+        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=1.0, top_db=None)
         log_mel_spectrogram = log_mel_spectrogram.T # Transpose to (num_frames, num_mel_bins)
 
         # 2. Frame into 0.96-second examples
-        # Ensure log_mel_spectrogram has enough frames to form at least one example
-        if log_mel_spectrogram.shape[0] < VGGISH_EXAMPLE_WINDOW_SAMPLES // VGGISH_STFT_HOP_LENGTH_SAMPLES:
-            # Pad the mel spectrogram if it's too short for even one example frame
-            min_frames_for_one_example = VGGISH_EXAMPLE_WINDOW_SAMPLES // VGGISH_STFT_HOP_LENGTH_SAMPLES
-            pad_amount = min_frames_for_one_example - log_mel_spectrogram.shape[0]
-            log_mel_spectrogram = np.pad(log_mel_spectrogram, ((0, pad_amount), (0, 0)), mode='constant')
-            print(f"DEBUG: Padded Mel spectrogram for framing. New shape: {log_mel_spectrogram.shape}")
-
-
-        # Use librosa.util.frame to segment the mel spectrogram
-        # The frames function expects (data, frame_length, hop_length, axis)
-        # Here, data is (num_frames, num_mel_bins), so frame_length is frames per example, hop_length is frames per hop
-        # The output of frame will be (num_examples, frames_per_example, num_mel_bins)
-        # The number of frames in one example (0.96s) is 0.96 / 0.01 = 96 frames
         frames_per_example = int(round(VGGISH_EXAMPLE_WINDOW_SECONDS / VGGISH_STFT_HOP_LENGTH_SECONDS))
         hop_frames = int(round(VGGISH_EXAMPLE_HOP_SECONDS / VGGISH_STFT_HOP_LENGTH_SECONDS))
 
-        # Ensure frames_per_example is not zero
         if frames_per_example == 0:
-            frames_per_example = 1 # Fallback to 1 frame if calculation results in 0, though unlikely with VGGish params
+            frames_per_example = 1
 
-        # Ensure log_mel_spectrogram has enough frames for at least one example
         if log_mel_spectrogram.shape[0] < frames_per_example:
             pad_needed = frames_per_example - log_mel_spectrogram.shape[0]
             log_mel_spectrogram = np.pad(log_mel_spectrogram, ((0, pad_needed), (0, 0)), mode='constant')
             print(f"DEBUG: Padded log_mel_spectrogram to ensure enough frames for examples. New shape: {log_mel_spectrogram.shape}")
 
-
-        # Apply framing to the log-Mel spectrogram
-        # The output shape will be (num_examples, frames_per_example, num_mel_bins)
-        # Note: librosa.util.frame operates on the first axis by default if axis is not specified.
-        # Our log_mel_spectrogram is (num_frames, num_mel_bins), so this is correct.
         framed_examples = librosa.util.frame(
             log_mel_spectrogram,
             frame_length=frames_per_example,
             hop_length=hop_frames,
-            axis=0 # Frame along the time axis (axis 0)
+            axis=0
         )
-        
-        # Transpose to get (num_examples, frames_per_example, num_mel_bins)
-        # librosa.util.frame returns (num_mel_bins, frames_per_example, num_examples) if axis=0 and data is (num_frames, num_mel_bins)
-        # So, we need to transpose to (num_examples, frames_per_example, num_mel_bins)
-        # Check the actual output shape of librosa.util.frame. It's usually (num_examples, frame_length, data_dim_2)
-        # Let's verify the output shape of librosa.util.frame.
-        # If input is (N_frames, N_mels), and frame_length, hop_length are in frames,
-        # output is (N_frames_out, frame_length, N_mels). This is the desired (num_examples, 96, 64)
-        
-        # No transpose needed if librosa.util.frame returns (num_examples, frames_per_example, num_mel_bins) directly.
-        # Let's assume it does for now, based on typical usage.
         
         all_examples.append(framed_examples)
 
-    # Stack all examples from the batch
-    # The output should be (batch_size * num_examples_per_audio, frames_per_example, num_mel_bins)
-    # The VGGish model expects (total_segments, 96, 64)
-    if not all_examples: # Handle case where no examples were generated (e.g., all audio too short)
+    if not all_examples:
         return np.empty((0, frames_per_example, VGGISH_MEL_BINS), dtype=np.float32)
 
     return np.concatenate(all_examples, axis=0)
 
-# --- END NEW CUSTOM FEATURE EXTRACTION ---
+# --- NEW: Custom VGGish Model Architecture (copied from torchvggish/vggish.py) ---
+class CustomVGGish(nn.Module):
+    def __init__(self):
+        super(CustomVGGish, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
+
+            nn.Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
+
+            nn.Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2)),
+
+            nn.Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
+        )
+        self.embeddings = nn.Sequential(
+            nn.Linear(512 * 4 * 6, 4096), # Adjusted based on 96x64 input and pooling
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 128),
+            nn.ReLU(inplace=True) # VGGish output is ReLU'd
+        )
+
+    def forward(self, x):
+        # Input x is (batch_size, num_frames, num_mel_bins) e.g., (N, 96, 64)
+        # VGGish expects (batch_size, 1, num_frames, num_mel_bins) for Conv2d
+        x = x.unsqueeze(1) # Add channel dimension: (N, 1, 96, 64)
+        
+        x = self.features(x)
+        
+        # Flatten the output of convolutional layers
+        # The output of the last MaxPool2d (kernel_size=2, stride=2) on 96x64 input:
+        # 96 / 2 / 2 / 2 / 2 = 6
+        # 64 / 2 / 2 / 2 / 2 = 4
+        # So, the feature map size is 6x4 (or 4x6 depending on which dimension is which).
+        # Let's verify this carefully.
+        # Input: (1, 96, 64)
+        # Pool1 (2x2): (1, 48, 32)
+        # Pool2 (2x2): (1, 24, 16)
+        # Pool3 (2x2): (1, 12, 8)
+        # Pool4 (2x2): (1, 6, 4)
+        # Output channels from last conv: 512
+        # So, the flattened size should be 512 * 6 * 4 = 12288
+        
+        x = x.permute(0, 2, 3, 1).contiguous() # (N, 6, 4, 512)
+        x = x.view(x.size(0), -1) # Flatten to (N, 512 * 6 * 4) = (N, 12288)
+
+        x = self.embeddings(x)
+        return x # Output shape: (N, 128)
+
+# --- END Custom VGGish Model Architecture ---
 
 
 # --- DATASET ---
@@ -229,7 +225,6 @@ class VoiceDataset(Dataset):
         self.files = files
         self.labels = labels
         self.augment = augment
-        # No Mel Spectrogram transform here, VGGish handles it internally from raw audio
 
     def __len__(self):
         return len(self.files)
@@ -239,46 +234,36 @@ class VoiceDataset(Dataset):
         label = self.labels[idx]
         
         target_length_samples = SAMPLE_RATE * DURATION
-        # Initialize wav with zeros of the target length. This ensures a valid array even if read fails.
         wav = np.zeros(target_length_samples, dtype=np.float32) 
         
         try:
             read_wav, sr = sf.read(path)
             
-            # If read_wav is None or empty, proceed with the zero-initialized 'wav'
             if read_wav is None or read_wav.size == 0:
                 print(f"⚠️ Warning: Audio file {path} is empty after sf.read. Using zero-padded array.")
             else:
-                # Resample. If resampling fails, catch the exception.
                 resampled_wav = librosa.resample(read_wav, orig_sr=sr, target_sr=SAMPLE_RATE)
                 
-                # Apply padding or truncation
                 if len(resampled_wav) < target_length_samples:
                     wav = np.pad(resampled_wav, (0, target_length_samples - len(resampled_wav)), 'constant')
                 elif len(resampled_wav) > target_length_samples:
                     wav = resampled_wav[:target_length_samples]
                 else:
-                    wav = resampled_wav # Length is already correct
+                    wav = resampled_wav
 
         except Exception as e:
             print(f"❌ Error during audio read/resample for {path}: {e}. Using zero-padded array.")
-            # 'wav' remains the zero-initialized array
         
-        # Final check to ensure 'wav' is of the correct size before augmentation/tensor conversion
-        # This should always be true due to initialization and padding, but as a safeguard.
         if wav.size != target_length_samples:
             print(f"❌ Critical Error: Final wav size mismatch for {path}. Expected {target_length_samples}, got {wav.size}. Forcing to zero array.")
             wav = np.zeros(target_length_samples, dtype=np.float32)
 
-        # Apply augmentation to the (potentially zero-padded) waveform
         if self.augment:
-            # Ensure wav is float32 for audiomentations
             if wav.dtype != np.float32:
                 print(f"DEBUG: Converting audio from {wav.dtype} to float32 before augmentation for {path}")
                 wav = wav.astype(np.float32)
             wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
 
-        # Debugging prints for wav after all processing in __getitem__
         print(f"DEBUG: __getitem__ output wav shape: {wav.shape}")
         print(f"DEBUG: __getitem__ output wav dtype: {wav.dtype}")
         if wav.size > 0:
@@ -288,7 +273,6 @@ class VoiceDataset(Dataset):
         else:
             print("DEBUG: __getitem__ output wav is empty.")
 
-        # Convert to tensor. Label is always valid as it comes from pre-filtered list.
         return torch.tensor(wav).float(), label
 
 
@@ -296,59 +280,41 @@ class VoiceDataset(Dataset):
 class VGGishFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.vggish = None # Initialize to None
+        self.vggish_base = CustomVGGish() # Use our custom VGGish model
+        self.vggish_base.eval() # Set to eval mode
+
+        # Load pre-trained weights from the original VGGish model
         try:
-            # Load pre-trained VGGish model from PyTorch Hub
-            # This will download the repository to the cache if not present
-            self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
-
-            if self.vggish is None:
-                raise RuntimeError("torch.hub.load('harritaylor/pytorch-vggish', 'vggish') returned None.")
-
-            # Set VGGish to evaluation mode (important for consistent feature extraction)
-            self.vggish.eval()
-
-            # Freeze VGGish parameters to use it as a fixed feature extractor
-            for param in self.vggish.parameters():
+            # Load the original VGGish model to get its state_dict
+            original_vggish_model = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', pretrained=True)
+            
+            # Load the state_dict into our custom model
+            self.vggish_base.load_state_dict(original_vggish_model.state_dict())
+            print("DEBUG: Pre-trained VGGish weights successfully loaded into CustomVGGish.")
+            
+            # Freeze parameters of the base VGGish model
+            for param in self.vggish_base.parameters():
                 param.requires_grad = False
-            print("DEBUG: VGGish model successfully loaded and configured.")
+            print("DEBUG: CustomVGGish parameters frozen.")
 
         except Exception as e:
-            print(f"❌ CRITICAL ERROR: Failed to load or configure VGGish model in __init__: {type(e).__name__}: {e}")
-            # If VGGish loading fails, self.vggish remains None, and forward will handle it.
+            print(f"❌ CRITICAL ERROR: Failed to load pre-trained VGGish weights or configure CustomVGGish in __init__: {type(e).__name__}: {e}")
+            # If loading fails, the model will proceed with randomly initialized weights for VGGish_base,
+            # but it will print an error, and training might be less effective.
 
     def forward(self, x):
         # x is [batch_size, num_samples] (raw audio)
-        # We now explicitly preprocess the waveform to VGGish examples (Mel Spectrograms)
-        # using our custom function.
+        if x.numel() == 0:
+            return torch.zeros(x.shape[0], 128).to(x.device)
 
-        # Move tensor to CPU for numpy conversion, then back to device
-        # Ensure x is contiguous before converting to numpy
-        # Handle potential empty input from collate_fn if all samples in a batch were problematic
-        if x.numel() == 0: # Check if the tensor is empty
-            # Return a dummy tensor of the expected output shape if input is empty
-            # This prevents crashing but means this batch won't contribute to training
-            return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
-
-        # Explicitly cast to float32 and ensure 1D or 2D for custom_waveform_to_examples
         numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
         
-        # Debugging prints for numpy_wav
         print(f"DEBUG: Input to VGGishFeatureExtractor.forward: x.shape={x.shape}, x.dtype={x.dtype}")
         print(f"DEBUG: numpy_wav shape before custom_waveform_to_examples: {numpy_wav.shape}")
-        print(f"DEBUG: numpy_wav dtype before custom_waveform_to_examples: {numpy_wav.dtype}")
-        if numpy_wav.size > 0:
-            print(f"DEBUG: numpy_wav min/max/mean: {numpy_wav.min():.4f}/{numpy_wav.max():.4f}/{numpy_wav.mean():.4f}")
-            print(f"DEBUG: numpy_wav contains NaN: {np.isnan(numpy_wav).any()}")
-            print(f"DEBUG: numpy_wav contains Inf: {np.isinf(numpy_wav).any()}")
-        else:
-            print("DEBUG: numpy_wav is empty.")
         
-        # --- NEW: Call custom_waveform_to_examples ---
         try:
             examples_batch_np = custom_waveform_to_examples(numpy_wav, SAMPLE_RATE)
             
-            # Debugging prints for examples_batch_np
             print(f"DEBUG: examples_batch_np shape after custom_waveform_to_examples: {examples_batch_np.shape}")
             print(f"DEBUG: examples_batch_np dtype after custom_waveform_to_examples: {examples_batch_np.dtype}")
             if examples_batch_np.size > 0:
@@ -358,52 +324,39 @@ class VGGishFeatureExtractor(nn.Module):
             else:
                 print("DEBUG: examples_batch_np is empty.")
 
-        except Exception as e: # Catch any unexpected errors from custom feature extraction
+        except Exception as e:
             print(f"❌ ERROR: Exception in custom_waveform_to_examples: {type(e).__name__}: {e}")
             print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
-            # Fallback for examples_batch_np if any error occurs
-            examples_batch_np = np.zeros((x.shape[0], 96, 64), dtype=np.float32) # Default VGGish example shape
-        # --- END NEW ---
+            examples_batch_np = np.zeros((x.shape[0], 96, 64), dtype=np.float32)
 
-        examples_batch = torch.from_numpy(examples_batch_np).to(x.device) # Use the potentially converted/fallback numpy array
+        examples_batch = torch.from_numpy(examples_batch_np).to(x.device)
 
-        # --- Aggressive error handling for vggish.forward ---
-        # Check if self.vggish is valid before calling forward
-        if self.vggish is None:
-            print("❌ ERROR: VGGish model was not successfully loaded in __init__. Returning zero-filled embeddings.")
-            return torch.zeros(x.shape[0], 128).to(x.device)
-
+        # --- NEW: Call forward on our CustomVGGish model ---
         try:
-            # self.vggish.forward already performs pooling to 128-dim per segment
-            embeddings = self.vggish.forward(examples_batch) # Expected output: (total_num_segments, 128)
-            print(f"DEBUG: Embeddings shape after self.vggish.forward: {embeddings.shape}")
+            # Our CustomVGGish model expects (N, 96, 64) and outputs (N, 128)
+            embeddings = self.vggish_base(examples_batch) # Pass through our custom VGGish
+            print(f"DEBUG: Embeddings shape after self.vggish_base.forward: {embeddings.shape}")
 
-            # --- NEW: Robust calculation of num_segments_per_audio ---
-            # Calculate num_segments_per_audio based on the actual output of vggish.forward
-            # This is the most robust way to handle variable segment counts per audio.
-            if x.shape[0] > 0: # Avoid division by zero if batch is empty
+            # Calculate num_segments_per_audio based on the actual output of embeddings
+            if x.shape[0] > 0:
                 num_segments_per_audio = embeddings.shape[0] // x.shape[0]
             else:
-                num_segments_per_audio = 1 # Fallback for empty batch, though handled earlier
+                num_segments_per_audio = 1
 
-            if num_segments_per_audio == 0: # Ensure it's never zero
+            if num_segments_per_audio == 0:
                 num_segments_per_audio = 1
             
             print(f"DEBUG: Dynamically calculated num_segments_per_audio: {num_segments_per_audio}")
             print(f"DEBUG: Expected total elements for reshape (batch_size * num_segments_per_audio * 128): {x.shape[0] * num_segments_per_audio * 128}")
             print(f"DEBUG: Actual embeddings.numel(): {embeddings.numel()}")
-            # --- END NEW ---
 
             # Reshape embeddings to (batch_size, num_segments_per_audio, 128)
-            # This is where the error must be originating if embeddings is not (total_num_segments, 128)
-            # or if the calculated num_segments_per_audio is wrong.
             try:
                 reshaped_embeddings = embeddings.view(x.shape[0], num_segments_per_audio, 128)
                 print(f"DEBUG: Reshaped embeddings shape: {reshaped_embeddings.shape}")
             except RuntimeError as e:
                 print(f"❌ CRITICAL ERROR: RuntimeError during reshape of embeddings: {type(e).__name__}: {e}")
                 print(f"   Attempting to reshape embeddings.shape={embeddings.shape} to ({x.shape[0]}, {num_segments_per_audio}, 128)")
-                # Fallback to zero-filled if reshape fails
                 return torch.zeros(x.shape[0], 128).to(x.device)
 
             # Average pool the embeddings across the time segments (dim=1)
@@ -411,46 +364,34 @@ class VGGishFeatureExtractor(nn.Module):
             print(f"DEBUG: Pooled embeddings shape: {pooled_embeddings.shape}")
 
         except Exception as e:
-            # Print the type and message of the exception for better debugging
-            print(f"❌ ERROR: Exception during self.vggish.forward or subsequent pooling: {type(e).__name__}: {e}")
+            print(f"❌ ERROR: Exception during self.vggish_base.forward or subsequent pooling: {type(e).__name__}: {e}")
             print("Returning zero-filled embeddings to prevent crash.")
-            pooled_embeddings = torch.zeros(x.shape[0], 128).to(x.device) # Fallback
+            pooled_embeddings = torch.zeros(x.shape[0], 128).to(x.device)
 
         return pooled_embeddings
 
 class TransferLearningCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
-        # Use the VGGish model as our feature extractor backbone
         self.feature_extractor = VGGishFeatureExtractor()
 
-        # Define a new classification head that takes VGGish embeddings (128 features)
-        # and outputs probabilities for our specific number of classes.
         self.classifier = nn.Sequential(
-            nn.Linear(128, 64), # First linear layer
-            nn.ReLU(),          # Activation function
-            nn.Dropout(0.5),    # Dropout for regularization
-            nn.Linear(64, num_classes) # Final linear layer to output class scores
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(64, num_classes)
         )
 
     def forward(self, x):
-        # Pass the raw audio through the VGGish feature extractor
-        features = self.feature_extractor(x) # Output: [batch_size, 128]
-        # --- NEW: Debugging print for features before classifier ---
+        features = self.feature_extractor(x)
         print(f"DEBUG: Features shape before classifier: {features.shape}")
-        # --- END NEW ---
-        # Pass the extracted features through the new classification head
         output = self.classifier(features)
         return output
 
 # --- MAIN TRAINING ---
 def main():
-    # The global import block at the very top handles VGGish module loading.
-    # No need for _ensure_vggish_modules_loaded() here anymore.
-
     download_training_data()
 
-    # Load file paths and labels
     all_audio_paths = []
     all_audio_labels = []
     for root, _, files in os.walk(DOWNLOAD_DIR):
@@ -464,34 +405,25 @@ def main():
         print("Training cannot proceed without data.")
         return
 
-    # --- Pre-filter problematic audio files here ---
     valid_audio_paths = []
     valid_audio_labels = []
-    target_length_samples = SAMPLE_RATE * DURATION
-
-    # Use the globally imported vggish_params for min_vggish_input_samples
-    # Now using our custom VGGISH_STFT_WINDOW_LENGTH_SECONDS
     min_vggish_input_samples = int(VGGISH_STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
     print(f"DEBUG: Using VGGish params for pre-validation - STFT_WINDOW_LENGTH_SECONDS={VGGISH_STFT_WINDOW_LENGTH_SECONDS}, Calculated min_vggish_input_samples={min_vggish_input_samples}")
-
 
     print("Pre-validating audio files...")
     for i, path in enumerate(all_audio_paths):
         try:
-            # Attempt to read and resample to ensure it's a valid audio file
             wav_check, sr_check = sf.read(path)
-            if wav_check is None or wav_check.size == 0: # Check for None or empty array
+            if wav_check is None or wav_check.size == 0:
                 print(f"Skipping empty audio file: {path}")
                 continue
             
             resampled_wav_check = librosa.resample(wav_check, orig_sr=sr_check, target_sr=SAMPLE_RATE)
             
-            # Check if the resampled audio is still too short for VGGish's internal framing
             if len(resampled_wav_check) < min_vggish_input_samples:
                 print(f"Skipping audio file too short for VGGish framing ({len(resampled_wav_check)} samples, min needed {min_vggish_input_samples}): {path}")
                 continue
 
-            # If it passes these checks, it's considered valid for inclusion
             valid_audio_paths.append(path)
             valid_audio_labels.append(all_audio_labels[i])
 
@@ -509,14 +441,10 @@ def main():
     NUM_CLASSES = len(label_encoder.classes_)
     print(f"Found {len(valid_audio_paths)} valid audio files across {NUM_CLASSES} classes.")
 
-    # Save class map
     with open("class_to_label.json", "w") as f:
         json.dump({str(i): label for i, label in enumerate(label_encoder.classes_)}, f)
     print("Class map saved to class_to_label.json")
 
-    # Stratified split
-    # Ensure there are enough samples for splitting (at least 2 per class for stratification)
-    # Check if any class has less than 2 samples for stratification
     label_counts = np.bincount(encoded_labels)
     can_stratify = all(count >= 2 for count in label_counts) and len(valid_audio_paths) >= 2
 
@@ -533,14 +461,10 @@ def main():
     train_dataset = VoiceDataset(X_train, y_train, augment=True)
     val_dataset = VoiceDataset(X_val, y_val, augment=False)
 
-    # Custom collate_fn (simplified as __getitem__ always returns valid data)
     def custom_collate_fn(batch):
-        # Filter out any samples that were returned as dummy data (label -1) from VoiceDataset
-        # This is a safeguard if __getitem__ failed to process a file even after pre-validation.
         filtered_batch = [item for item in batch if item[1] != -1]
         
         if not filtered_batch:
-            # Return empty tensors of correct shape if batch is empty, to avoid DataLoader crash
             return torch.empty(0, SAMPLE_RATE * DURATION).float(), torch.empty(0, dtype=torch.long)
         
         audios = torch.stack([item[0] for item in filtered_batch])
@@ -550,22 +474,19 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, collate_fn=custom_collate_fn)
 
-    # Initialize model with the new TransferLearningCNN
     model = TransferLearningCNN(NUM_CLASSES).to(DEVICE)
     print(f"Model initialized with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
     print(f"Using device: {DEVICE}")
 
     loss_fn = nn.CrossEntropyLoss()
-    # Use a slightly smaller learning rate for fine-tuning, or if only training the head
-    optimizer = optim.Adam(model.parameters(), lr=0.0005) # Adjusted learning rate
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
 
     best_val_acc = 0
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
         for batch_idx, (x, y) in enumerate(train_loader):
-            # Skip empty batches from custom_collate_fn
-            if x.numel() == 0: # Check if tensor is empty
+            if x.numel() == 0:
                 print(f"  Skipping empty batch {batch_idx+1} in training (no valid samples).")
                 continue
 
@@ -577,17 +498,15 @@ def main():
             optimizer.step()
             total_loss += loss.item()
 
-            if (batch_idx + 1) % 10 == 0: # Print loss every 10 batches
+            if (batch_idx + 1) % 10 == 0:
                 print(f"  Batch {batch_idx+1}/{len(train_loader)} - Train Loss: {loss.item():.4f}")
 
 
-        # Validation
         model.eval()
         correct = total = 0
         with torch.no_grad():
-            for batch_idx_val, (x, y) in enumerate(val_loader): # Added batch_idx_val for clarity
-                # Skip empty batches from custom_collate_fn
-                if x.numel() == 0: # Check if tensor is empty
+            for batch_idx_val, (x, y) in enumerate(val_loader):
+                if x.numel() == 0:
                     print(f"  Skipping empty batch {batch_idx_val+1} in validation (no valid samples).")
                     continue
 
@@ -596,7 +515,6 @@ def main():
                 correct += (preds.argmax(1) == y).sum().item()
                 total += y.size(0)
 
-        # Ensure total is not zero to avoid division by zero
         acc = correct / total if total > 0 else 0.0
         print(f"Epoch {epoch+1} - Loss: {total_loss:.4f}, Val Acc: {acc:.4f}")
 
@@ -608,6 +526,5 @@ def main():
     print("🎉 Training complete")
 
 if __name__ == "__main__":
-    # Ensure shutil is imported if main is called directly for local testing
     import shutil
     main()
