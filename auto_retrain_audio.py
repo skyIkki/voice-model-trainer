@@ -247,41 +247,36 @@ class VGGishFeatureExtractor(nn.Module):
         else:
             print("DEBUG: vggish_params module not loaded, cannot print internal VGGish parameters.")
 
-        # --- NEW: Aggressive error handling for waveform_to_examples ---
+        # --- NEW: Aggressive error handling for waveform_to_examples and type conversion ---
         try:
-            examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
+            temp_examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
+            
+            # Explicitly convert to numpy array if it's a Tensor
+            if isinstance(temp_examples_batch, torch.Tensor):
+                print("DEBUG: vggish_input.waveform_to_examples returned a Tensor. Converting to NumPy array.")
+                examples_batch_np = temp_examples_batch.cpu().numpy()
+            else:
+                examples_batch_np = temp_examples_batch # Already a NumPy array
+
         except ValueError as e:
             print(f"❌ ERROR: ValueError in vggish_input.waveform_to_examples: {e}")
-            print("Returning zero-filled examples_batch to prevent crash.")
-            # Calculate expected examples_batch shape for a 3-second audio (48000 samples)
-            # VGGish produces roughly 1 frame per 0.01 seconds (hop length)
-            # So, 3 seconds / 0.01 seconds/frame = 300 frames.
-            # Each frame has 96 mel bins.
-            # And VGGish outputs 128-dim embeddings.
-            # A rough estimate for examples_batch shape: [batch_size, num_frames, num_mels]
-            # num_frames = (SAMPLE_RATE * DURATION - STFT_WINDOW_LENGTH_SAMPLES) / STFT_HOP_LENGTH_SAMPLES + 1
-            # num_frames = (48000 - 400) / 160 + 1 = 297.5 + 1 = 298.5 -> 298 frames
-            # num_mels is 64 for VGGish mel_features
-            # Let's use a fixed shape that matches VGGish's output before pooling
-            # This is a placeholder, actual shape depends on VGGish internal parameters
-            # For a 3-second clip at 16kHz, VGGish generates ~298 frames of 64 mel bins.
-            # The actual output of waveform_to_examples is (num_examples, num_frames, num_mel_bins)
-            # where num_examples is the batch size.
-            # Let's assume a default reasonable number of frames, e.g., 300 frames, 64 mel bins.
-            # This is a hacky fallback, but it's to prevent the crash.
+            print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
+            # Fallback for examples_batch_np if ValueError occurs
             num_frames_fallback = int((SAMPLE_RATE * DURATION - vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) / (vggish_params.STFT_HOP_LENGTH_SECONDS * SAMPLE_RATE)) + 1
-            if num_frames_fallback <= 0: # Ensure it's at least 1 frame
+            if num_frames_fallback <= 0:
                 num_frames_fallback = 1
-            
-            # The output of waveform_to_examples is typically (num_batches, num_frames, num_mel_bins)
-            # where num_mel_bins is 64 for VGGish.
-            examples_batch = np.zeros((numpy_wav.shape[0] if numpy_wav.ndim > 1 else 1, num_frames_fallback, 64), dtype=np.float32)
-            # If numpy_wav was 1D, its shape[0] is the length, so we need to use x.shape[0] (batch size)
-            examples_batch = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
+            examples_batch_np = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
+        except Exception as e: # Catch any other unexpected errors
+            print(f"❌ UNEXPECTED ERROR in vggish_input.waveform_to_examples: {e}")
+            print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
+            num_frames_fallback = int((SAMPLE_RATE * DURATION - vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) / (vggish_params.STFT_HOP_LENGTH_SECONDS * SAMPLE_RATE)) + 1
+            if num_frames_fallback <= 0:
+                num_frames_fallback = 1
+            examples_batch_np = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
 
         # --- END NEW ---
 
-        examples_batch = torch.from_numpy(examples_batch).to(x.device) # Move back to device
+        examples_batch = torch.from_numpy(examples_batch_np).to(x.device) # Use the potentially converted/fallback numpy array
 
         # Pass the preprocessed examples through VGGish's feature extraction layers
         # The vggish model's forward method can take these examples directly
