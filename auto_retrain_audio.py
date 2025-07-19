@@ -15,13 +15,19 @@ from audiomentations import Compose, AddGaussianNoise, TimeStretch, PitchShift, 
 import json # Import json for saving class map
 import sys # Import sys for path manipulation
 
-# --- NEW: Load VGGish related modules at the top, after ensuring path ---
-# This block ensures torchvggish is available before any other imports from it.
+# --- CRITICAL: Ensure VGGish related modules are loaded globally and early ---
+# This block ensures torchvggish is available before any other code uses it.
+vggish_input = None
+vggish_params = None
+
 try:
-    # Attempt to load VGGish model to ensure the repository is cloned to torch.hub cache
-    # This is a prerequisite for importing from torchvggish directly.
-    # We don't store the model instance here, just trigger the download.
+    # First, ensure the repository is cloned and cached by torch.hub
+    # This call is blocking and will download the repo if not present.
+    print("Ensuring VGGish repository is cloned to torch.hub cache...")
+    # Use a dummy variable for the model as we just need the side effect of cloning
     _ = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', verbose=False)
+    print("VGGish repository successfully cloned/found in cache.")
+
     vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
     torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
 
@@ -30,17 +36,18 @@ try:
         print(f"Added {torchvggish_path} to sys.path for VGGish modules.")
 
     # Now, import the modules directly since the path is set
-    from torchvggish import vggish_input
-    from torchvggish import vggish_params
+    from torchvggish import vggish_input as imported_vggish_input
+    from torchvggish import vggish_params as imported_vggish_params
+    vggish_input = imported_vggish_input
+    vggish_params = imported_vggish_params
     print("Successfully imported vggish_input and vggish_params globally.")
 
 except Exception as e:
-    print(f"❌ Critical Error: Failed to setup VGGish module imports. Training will likely fail. Error: {e}")
-    # Set placeholders to None if import fails, to allow graceful error handling later
-    vggish_input = None
-    vggish_params = None
+    print(f"❌ CRITICAL ERROR: Failed to setup VGGish module imports globally. Training will likely fail. Error: {e}")
+    # vggish_input and vggish_params remain None, which will trigger errors later if used.
 
-# --- END NEW ---
+# --- END CRITICAL GLOBAL IMPORT BLOCK ---
+
 
 # --- CONFIGURATION ---
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
@@ -253,8 +260,8 @@ class TransferLearningCNN(nn.Module):
 
 # --- MAIN TRAINING ---
 def main():
-    # No need to call _ensure_vggish_modules_loaded() here anymore,
-    # as the global import block at the very top handles it.
+    # The global import block at the very top handles VGGish module loading.
+    # No need for _ensure_vggish_modules_loaded() here anymore.
 
     download_training_data()
 
@@ -278,12 +285,14 @@ def main():
     target_length_samples = SAMPLE_RATE * DURATION
 
     # Use the globally imported vggish_params for min_vggish_input_samples
+    min_vggish_input_samples = SAMPLE_RATE * 0.1 # Default fallback
+
     if vggish_params is not None:
         min_vggish_input_samples = int(vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
+        print(f"DEBUG: Using VGGish params: STFT_WINDOW_LENGTH_SECONDS={vggish_params.STFT_WINDOW_LENGTH_SECONDS}, Calculated min_vggish_input_samples={min_vggish_input_samples}")
     else:
         # Fallback if vggish_params could not be loaded at startup
         print("Warning: vggish_params not loaded globally. Using default min_vggish_input_samples for pre-validation.")
-        min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds
 
 
     print("Pre-validating audio files...")
