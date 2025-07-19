@@ -16,35 +16,16 @@ import json # Import json for saving class map
 import sys # Import sys for path manipulation
 
 # --- CRITICAL: Ensure VGGish related modules are loaded globally and early ---
-# This block ensures torchvggish is available before any other code uses it.
-vggish_input = None
-vggish_params = None
-
+# We still load the VGGish model from torch.hub for its pre-trained weights,
+# but we will replace its internal preprocessing with our custom one.
 try:
-    # First, ensure the repository is cloned and cached by torch.hub
-    # This call is blocking and will download the repo if not present.
     print("Ensuring VGGish repository is cloned to torch.hub cache...")
     # Use a dummy variable for the model as we just need the side effect of cloning
     _ = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', verbose=False)
     print("VGGish repository successfully cloned/found in cache.")
 
-    vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
-    torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
-
-    if torchvggish_path not in sys.path:
-        sys.path.insert(0, torchvggish_path)
-        print(f"Added {torchvggish_path} to sys.path for VGGish modules.")
-
-    # Now, import the modules directly since the path is set
-    from torchvggish import vggish_input as imported_vggish_input
-    from torchvggish import vggish_params as imported_vggish_params
-    vggish_input = imported_vggish_input
-    vggish_params = imported_vggish_params
-    print("Successfully imported vggish_input and vggish_params globally.")
-
 except Exception as e:
-    print(f"❌ CRITICAL ERROR: Failed to setup VGGish module imports globally. Training will likely fail. Error: {e}")
-    # vggish_input and vggish_params remain None, which will trigger errors later if used.
+    print(f"❌ CRITICAL ERROR: Failed to clone VGGish repository via torch.hub. Training will likely fail. Error: {e}")
 
 # --- END CRITICAL GLOBAL IMPORT BLOCK ---
 
@@ -58,6 +39,23 @@ NUM_CLASSES = 0 # Will be set dynamically
 BATCH_SIZE = 8
 EPOCHS = 30
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- VGGish-specific Mel Spectrogram Parameters (from vggish_params.py) ---
+# These parameters are crucial for generating Mel features compatible with VGGish
+VGGISH_SAMPLE_RATE = 16000
+VGGISH_STFT_WINDOW_LENGTH_SECONDS = 0.025 # 25ms
+VGGISH_STFT_HOP_LENGTH_SECONDS = 0.010    # 10ms
+VGGISH_MEL_BINS = 64
+VGGISH_MEL_MIN_HZ = 125
+VGGISH_MEL_MAX_HZ = 7500
+VGGISH_EXAMPLE_WINDOW_SECONDS = 0.96 # 960ms
+VGGISH_EXAMPLE_HOP_SECONDS = 0.96    # 960ms (no overlap for examples)
+
+# Calculated parameters
+VGGISH_STFT_WINDOW_LENGTH_SAMPLES = int(round(VGGISH_STFT_WINDOW_LENGTH_SECONDS * VGGISH_SAMPLE_RATE))
+VGGISH_STFT_HOP_LENGTH_SAMPLES = int(round(VGGISH_STFT_HOP_LENGTH_SECONDS * VGGISH_SAMPLE_RATE))
+VGGISH_EXAMPLE_WINDOW_SAMPLES = int(round(VGGISH_EXAMPLE_WINDOW_SECONDS * VGGISH_SAMPLE_RATE))
+VGGISH_EXAMPLE_HOP_SAMPLES = int(round(VGGISH_EXAMPLE_HOP_SECONDS * VGGISH_SAMPLE_RATE))
 
 # --- AUDIO AUGMENTATION ---
 augment = Compose([
@@ -118,6 +116,113 @@ def download_training_data():
     if downloaded_count == 0:
         print(f"⚠️ No .wav files found in '{DOWNLOAD_DIR}' prefix in Firebase Storage.")
 
+# --- NEW: Custom VGGish-style waveform to examples function ---
+def custom_waveform_to_examples(data, sample_rate):
+    """
+    Converts audio waveform into a sequence of log-Mel spectrogram examples,
+    compatible with VGGish input requirements.
+    This replaces torchvggish.vggish_input.waveform_to_examples.
+    """
+    if data.ndim == 1:
+        # Single audio waveform, reshape to (1, num_samples) for consistent batching
+        data = np.expand_dims(data, 0)
+    
+    # Ensure data is float32
+    data = data.astype(np.float32)
+
+    all_examples = []
+    for waveform in data:
+        # 1. Compute STFT magnitude spectrogram
+        # Use n_fft and hop_length that match VGGish's window and hop sizes
+        n_fft = VGGISH_STFT_WINDOW_LENGTH_SAMPLES
+        hop_length = VGGISH_STFT_HOP_LENGTH_SAMPLES
+
+        # Pad waveform if it's too short to create even one frame
+        if len(waveform) < n_fft:
+            waveform = np.pad(waveform, (0, n_fft - len(waveform)), mode='constant')
+
+        # Compute Mel spectrogram
+        mel_spectrogram = librosa.feature.melspectrogram(
+            y=waveform,
+            sr=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=VGGISH_MEL_BINS,
+            fmin=VGGISH_MEL_MIN_HZ,
+            fmax=VGGISH_MEL_MAX_HZ,
+            power=1.0 # Use power=1.0 for magnitude spectrogram, then convert to dB
+        )
+
+        # Convert to log scale (dB)
+        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=1.0, top_db=None) # VGGish uses top_db=None
+
+        # VGGish expects frames as (num_frames, num_mel_bins)
+        log_mel_spectrogram = log_mel_spectrogram.T # Transpose to (num_frames, num_mel_bins)
+
+        # 2. Frame into 0.96-second examples
+        # Ensure log_mel_spectrogram has enough frames to form at least one example
+        if log_mel_spectrogram.shape[0] < VGGISH_EXAMPLE_WINDOW_SAMPLES // VGGISH_STFT_HOP_LENGTH_SAMPLES:
+            # Pad the mel spectrogram if it's too short for even one example frame
+            min_frames_for_one_example = VGGISH_EXAMPLE_WINDOW_SAMPLES // VGGISH_STFT_HOP_LENGTH_SAMPLES
+            pad_amount = min_frames_for_one_example - log_mel_spectrogram.shape[0]
+            log_mel_spectrogram = np.pad(log_mel_spectrogram, ((0, pad_amount), (0, 0)), mode='constant')
+            print(f"DEBUG: Padded Mel spectrogram for framing. New shape: {log_mel_spectrogram.shape}")
+
+
+        # Use librosa.util.frame to segment the mel spectrogram
+        # The frames function expects (data, frame_length, hop_length, axis)
+        # Here, data is (num_frames, num_mel_bins), so frame_length is frames per example, hop_length is frames per hop
+        # The output of frame will be (num_examples, frames_per_example, num_mel_bins)
+        # The number of frames in one example (0.96s) is 0.96 / 0.01 = 96 frames
+        frames_per_example = int(round(VGGISH_EXAMPLE_WINDOW_SECONDS / VGGISH_STFT_HOP_LENGTH_SECONDS))
+        hop_frames = int(round(VGGISH_EXAMPLE_HOP_SECONDS / VGGISH_STFT_HOP_LENGTH_SECONDS))
+
+        # Ensure frames_per_example is not zero
+        if frames_per_example == 0:
+            frames_per_example = 1 # Fallback to 1 frame if calculation results in 0, though unlikely with VGGish params
+
+        # Ensure log_mel_spectrogram has enough frames for at least one example
+        if log_mel_spectrogram.shape[0] < frames_per_example:
+            pad_needed = frames_per_example - log_mel_spectrogram.shape[0]
+            log_mel_spectrogram = np.pad(log_mel_spectrogram, ((0, pad_needed), (0, 0)), mode='constant')
+            print(f"DEBUG: Padded log_mel_spectrogram to ensure enough frames for examples. New shape: {log_mel_spectrogram.shape}")
+
+
+        # Apply framing to the log-Mel spectrogram
+        # The output shape will be (num_examples, frames_per_example, num_mel_bins)
+        # Note: librosa.util.frame operates on the first axis by default if axis is not specified.
+        # Our log_mel_spectrogram is (num_frames, num_mel_bins), so this is correct.
+        framed_examples = librosa.util.frame(
+            log_mel_spectrogram,
+            frame_length=frames_per_example,
+            hop_length=hop_frames,
+            axis=0 # Frame along the time axis (axis 0)
+        )
+        
+        # Transpose to get (num_examples, frames_per_example, num_mel_bins)
+        # librosa.util.frame returns (num_mel_bins, frames_per_example, num_examples) if axis=0 and data is (num_frames, num_mel_bins)
+        # So, we need to transpose to (num_examples, frames_per_example, num_mel_bins)
+        # Check the actual output shape of librosa.util.frame. It's usually (num_examples, frame_length, data_dim_2)
+        # Let's verify the output shape of librosa.util.frame.
+        # If input is (N_frames, N_mels), and frame_length, hop_length are in frames,
+        # output is (N_frames_out, frame_length, N_mels). This is the desired (num_examples, 96, 64)
+        
+        # No transpose needed if librosa.util.frame returns (num_examples, frames_per_example, num_mel_bins) directly.
+        # Let's assume it does for now, based on typical usage.
+        
+        all_examples.append(framed_examples)
+
+    # Stack all examples from the batch
+    # The output should be (batch_size * num_examples_per_audio, frames_per_example, num_mel_bins)
+    # The VGGish model expects (total_segments, 96, 64)
+    if not all_examples: # Handle case where no examples were generated (e.g., all audio too short)
+        return np.empty((0, frames_per_example, VGGISH_MEL_BINS), dtype=np.float32)
+
+    return np.concatenate(all_examples, axis=0)
+
+# --- END NEW CUSTOM FEATURE EXTRACTION ---
+
+
 # --- DATASET ---
 class VoiceDataset(Dataset):
     def __init__(self, files, labels, augment=False):
@@ -167,9 +272,9 @@ class VoiceDataset(Dataset):
 
         # Apply augmentation to the (potentially zero-padded) waveform
         if self.augment:
-            # Check dtype before augmentation if it's float64
-            if wav.dtype == np.float64:
-                print(f"DEBUG: Converting audio from float64 to float32 before augmentation for {path}")
+            # Ensure wav is float32 for audiomentations
+            if wav.dtype != np.float32:
+                print(f"DEBUG: Converting audio from {wav.dtype} to float32 before augmentation for {path}")
                 wav = wav.astype(np.float32)
             wav = augment(samples=wav, sample_rate=SAMPLE_RATE)
 
@@ -215,13 +320,7 @@ class VGGishFeatureExtractor(nn.Module):
     def forward(self, x):
         # x is [batch_size, num_samples] (raw audio)
         # We now explicitly preprocess the waveform to VGGish examples (Mel Spectrograms)
-        # This bypasses the problematic _preprocess method in vggish.py
-        # vggish_input.waveform_to_examples expects a 1D numpy array or a 2D tensor [batch_size, samples]
-        # and returns [batch_size, num_frames, num_mels]
-
-        # Ensure vggish_input is not None before using it
-        if vggish_input is None: # Use the globally imported vggish_input
-            raise RuntimeError("vggish_input module was not successfully loaded globally. Check script startup.")
+        # using our custom function.
 
         # Move tensor to CPU for numpy conversion, then back to device
         # Ensure x is contiguous before converting to numpy
@@ -231,17 +330,13 @@ class VGGishFeatureExtractor(nn.Module):
             # This prevents crashing but means this batch won't contribute to training
             return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
 
-        # Explicitly cast to float32 and ensure 1D or 2D for waveform_to_examples
-        # If batch size is 1, flatten to 1D array as waveform_to_examples can take (N,) or (B, N)
-        if x.dim() == 2 and x.shape[0] == 1:
-            numpy_wav = x.cpu().contiguous().numpy().flatten().astype(np.float32)
-        else:
-            numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
+        # Explicitly cast to float32 and ensure 1D or 2D for custom_waveform_to_examples
+        numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
         
-        # Debugging prints for numpy_wav and VGGish parameters
+        # Debugging prints for numpy_wav
         print(f"DEBUG: Input to VGGishFeatureExtractor.forward: x.shape={x.shape}, x.dtype={x.dtype}")
-        print(f"DEBUG: numpy_wav shape before waveform_to_examples: {numpy_wav.shape}")
-        print(f"DEBUG: numpy_wav dtype before waveform_to_examples: {numpy_wav.dtype}")
+        print(f"DEBUG: numpy_wav shape before custom_waveform_to_examples: {numpy_wav.shape}")
+        print(f"DEBUG: numpy_wav dtype before custom_waveform_to_examples: {numpy_wav.dtype}")
         if numpy_wav.size > 0:
             print(f"DEBUG: numpy_wav min/max/mean: {numpy_wav.min():.4f}/{numpy_wav.max():.4f}/{numpy_wav.mean():.4f}")
             print(f"DEBUG: numpy_wav contains NaN: {np.isnan(numpy_wav).any()}")
@@ -249,33 +344,13 @@ class VGGishFeatureExtractor(nn.Module):
         else:
             print("DEBUG: numpy_wav is empty.")
         
-        if vggish_params is not None:
-            print(f"DEBUG: VGGish Params - STFT_WINDOW_LENGTH_SECONDS: {vggish_params.STFT_WINDOW_LENGTH_SECONDS}")
-            print(f"DEBUG: VGGish Params - STFT_HOP_LENGTH_SECONDS: {vggish_params.STFT_HOP_LENGTH_SECONDS}")
-            print(f"DEBUG: VGGish Params - SAMPLE_RATE: {vggish_params.SAMPLE_RATE}")
-        else:
-            print("DEBUG: vggish_params module not loaded, cannot print internal VGGish parameters.")
-
-        # --- Aggressive error handling for waveform_to_examples and type conversion ---
+        # --- NEW: Call custom_waveform_to_examples ---
         try:
-            temp_examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
+            examples_batch_np = custom_waveform_to_examples(numpy_wav, SAMPLE_RATE)
             
-            # Explicitly convert to numpy array if it's a Tensor, detaching first
-            if isinstance(temp_examples_batch, torch.Tensor):
-                print("DEBUG: vggish_input.waveform_to_examples returned a Tensor. Detaching and converting to NumPy array.")
-                examples_batch_np = temp_examples_batch.detach().cpu().numpy() # ADDED .detach()
-            else:
-                examples_batch_np = temp_examples_batch # Already a NumPy array
-
-            # Squeeze out the problematic dimension if it exists and is 1
-            if examples_batch_np.ndim == 4 and examples_batch_np.shape[1] == 1:
-                print(f"DEBUG: Squeezing problematic dimension from examples_batch_np. Shape before: {examples_batch_np.shape}")
-                examples_batch_np = np.squeeze(examples_batch_np, axis=1)
-                print(f"DEBUG: Shape after squeezing: {examples_batch_np.shape}")
-
             # Debugging prints for examples_batch_np
-            print(f"DEBUG: examples_batch_np shape after conversion and squeeze: {examples_batch_np.shape}")
-            print(f"DEBUG: examples_batch_np dtype after conversion and squeeze: {examples_batch_np.dtype}")
+            print(f"DEBUG: examples_batch_np shape after custom_waveform_to_examples: {examples_batch_np.shape}")
+            print(f"DEBUG: examples_batch_np dtype after custom_waveform_to_examples: {examples_batch_np.dtype}")
             if examples_batch_np.size > 0:
                 print(f"DEBUG: examples_batch_np min/max/mean: {examples_batch_np.min():.4f}/{examples_batch_np.max():.4f}/{examples_batch_np.mean():.4f}")
                 print(f"DEBUG: examples_batch_np contains NaN: {np.isnan(examples_batch_np).any()}")
@@ -283,25 +358,17 @@ class VGGishFeatureExtractor(nn.Module):
             else:
                 print("DEBUG: examples_batch_np is empty.")
 
-        except Exception as e: # Catch any unexpected errors, including ValueError
-            print(f"❌ ERROR: Exception in vggish_input.waveform_to_examples (or subsequent squeeze): {type(e).__name__}: {e}")
+        except Exception as e: # Catch any unexpected errors from custom feature extraction
+            print(f"❌ ERROR: Exception in custom_waveform_to_examples: {type(e).__name__}: {e}")
             print("Returning zero-filled examples_batch (NumPy) to prevent crash.")
             # Fallback for examples_batch_np if any error occurs
-            # We need to ensure vggish_params is available for this fallback.
-            stft_window_len_s = vggish_params.STFT_WINDOW_LENGTH_SECONDS if vggish_params else 0.025
-            stft_hop_len_s = vggish_params.STFT_HOP_LENGTH_SECONDS if vggish_params else 0.01
-            
-            num_frames_fallback = int((SAMPLE_RATE * DURATION - stft_window_len_s * SAMPLE_RATE) / (stft_hop_len_s * SAMPLE_RATE)) + 1
-            if num_frames_fallback <= 0:
-                num_frames_fallback = 1
-            examples_batch_np = np.zeros((x.shape[0], num_frames_fallback, 64), dtype=np.float32)
-
-        # --- END Aggressive error handling ---
+            examples_batch_np = np.zeros((x.shape[0], 96, 64), dtype=np.float32) # Default VGGish example shape
+        # --- END NEW ---
 
         examples_batch = torch.from_numpy(examples_batch_np).to(x.device) # Use the potentially converted/fallback numpy array
 
         # --- Aggressive error handling for vggish.forward ---
-        # NEW: Check if self.vggish is valid before calling forward
+        # Check if self.vggish is valid before calling forward
         if self.vggish is None:
             print("❌ ERROR: VGGish model was not successfully loaded in __init__. Returning zero-filled embeddings.")
             return torch.zeros(x.shape[0], 128).to(x.device)
@@ -403,14 +470,9 @@ def main():
     target_length_samples = SAMPLE_RATE * DURATION
 
     # Use the globally imported vggish_params for min_vggish_input_samples
-    min_vggish_input_samples = SAMPLE_RATE * 0.1 # Default fallback
-
-    if vggish_params is not None:
-        min_vggish_input_samples = int(vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
-        print(f"DEBUG: Using VGGish params for pre-validation - STFT_WINDOW_LENGTH_SECONDS={vggish_params.STFT_WINDOW_LENGTH_SECONDS}, Calculated min_vggish_input_samples={min_vggish_input_samples}")
-    else:
-        # Fallback if vggish_params could not be loaded at startup
-        print("Warning: vggish_params not loaded globally. Using default min_vggish_input_samples for pre-validation.")
+    # Now using our custom VGGISH_STFT_WINDOW_LENGTH_SECONDS
+    min_vggish_input_samples = int(VGGISH_STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
+    print(f"DEBUG: Using VGGish params for pre-validation - STFT_WINDOW_LENGTH_SECONDS={VGGISH_STFT_WINDOW_LENGTH_SECONDS}, Calculated min_vggish_input_samples={min_vggish_input_samples}")
 
 
     print("Pre-validating audio files...")
