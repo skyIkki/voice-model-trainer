@@ -209,9 +209,14 @@ class VGGishFeatureExtractor(nn.Module):
             return torch.zeros(x.shape[0], 128).to(x.device) # Assuming x.shape[0] is batch size
 
         # --- NEW: Explicitly cast to float32 and ensure 1D or 2D for waveform_to_examples ---
-        numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
+        # If batch size is 1, flatten to 1D array as waveform_to_examples can take (N,) or (B, N)
+        if x.dim() == 2 and x.shape[0] == 1:
+            numpy_wav = x.cpu().contiguous().numpy().flatten().astype(np.float32)
+        else:
+            numpy_wav = x.cpu().contiguous().numpy().astype(np.float32)
         
-        # --- NEW: Debugging prints for numpy_wav ---
+        # --- NEW: Debugging prints for numpy_wav and VGGish parameters ---
+        print(f"DEBUG: Input to VGGishFeatureExtractor.forward: x.shape={x.shape}, x.dtype={x.dtype}")
         print(f"DEBUG: numpy_wav shape before waveform_to_examples: {numpy_wav.shape}")
         print(f"DEBUG: numpy_wav dtype before waveform_to_examples: {numpy_wav.dtype}")
         if numpy_wav.size > 0:
@@ -220,6 +225,13 @@ class VGGishFeatureExtractor(nn.Module):
             print(f"DEBUG: numpy_wav contains Inf: {np.isinf(numpy_wav).any()}")
         else:
             print("DEBUG: numpy_wav is empty.")
+        
+        if vggish_params is not None:
+            print(f"DEBUG: VGGish Params - STFT_WINDOW_LENGTH_SECONDS: {vggish_params.STFT_WINDOW_LENGTH_SECONDS}")
+            print(f"DEBUG: VGGish Params - STFT_HOP_LENGTH_SECONDS: {vggish_params.STFT_HOP_LENGTH_SECONDS}")
+            print(f"DEBUG: VGGish Params - SAMPLE_RATE: {vggish_params.SAMPLE_RATE}")
+        else:
+            print("DEBUG: vggish_params module not loaded, cannot print internal VGGish parameters.")
         # --- END NEW ---
 
         examples_batch = vggish_input.waveform_to_examples(numpy_wav, SAMPLE_RATE)
@@ -289,7 +301,7 @@ def main():
 
     if vggish_params is not None:
         min_vggish_input_samples = int(vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
-        print(f"DEBUG: Using VGGish params: STFT_WINDOW_LENGTH_SECONDS={vggish_params.STFT_WINDOW_LENGTH_SECONDS}, Calculated min_vggish_input_samples={min_vggish_input_samples}")
+        print(f"DEBUG: Using VGGish params for pre-validation - STFT_WINDOW_LENGTH_SECONDS={vggish_params.STFT_WINDOW_LENGTH_SECONDS}, Calculated min_vggish_input_samples={min_vggish_input_samples}")
     else:
         # Fallback if vggish_params could not be loaded at startup
         print("Warning: vggish_params not loaded globally. Using default min_vggish_input_samples for pre-validation.")
