@@ -171,34 +171,49 @@ class VGGishFeatureExtractor(nn.Module):
             param.requires_grad = False
 
     def forward(self, x):
-        if _vggish_input_module is None:
-            raise RuntimeError("vggish_input_module not loaded")
-        if x.numel() == 0:
-            return torch.zeros(x.shape[0], 128).to(x.device)
+    if _vggish_input_module is None:
+        raise RuntimeError("vggish_input_module not loaded")
+    if x.numel() == 0:
+        return torch.zeros(x.shape[0], 128).to(x.device)
 
-        batch_numpy = x.cpu().contiguous().numpy()
+    batch_numpy = x.cpu().contiguous().numpy()
 
-        # VGGish STFT constants
-        window_length = int(SAMPLE_RATE * _vggish_params_module.STFT_WINDOW_LENGTH_SECONDS)  # 0.025s * 16k = 400
-        hop_length = int(SAMPLE_RATE * _vggish_params_module.STFT_HOP_LENGTH_SECONDS)        # 0.010s * 16k = 160
-        min_num_frames = 1  # you can raise this to 2 or 3 if needed
+    # VGGish STFT config
+    window_length = int(SAMPLE_RATE * _vggish_params_module.STFT_WINDOW_LENGTH_SECONDS)  # 400
+    hop_length = int(SAMPLE_RATE * _vggish_params_module.STFT_HOP_LENGTH_SECONDS)        # 160
+    min_frames = 1
+    min_required_samples = window_length + (min_frames - 1) * hop_length  # minimum for at least 1 frame
 
-        min_required_samples = window_length + (min_num_frames - 1) * hop_length  # at least 1 frame
+    padded_batch = []
+    for idx, sample in enumerate(batch_numpy):
+        if sample.shape[0] < min_required_samples:
+            pad_len = min_required_samples - sample.shape[0]
+            print(f"⚠️ Padding sample {idx} from {sample.shape[0]} to {min_required_samples}")
+            sample = np.pad(sample, (0, pad_len), mode='constant')
 
-        padded_batch = []
-        for sample in batch_numpy:
-            if sample.shape[0] < min_required_samples:
-                pad_len = min_required_samples - sample.shape[0]
-                print(f"⚠️ Padding sample from {sample.shape[0]} to {min_required_samples}")
-                sample = np.pad(sample, (0, pad_len), mode='constant')
-            padded_batch.append(sample)
+        # Double check length is valid after padding
+        total_frames = 1 + (len(sample) - window_length) // hop_length
+        if total_frames <= 0:
+            print(f"❌ Skipping sample {idx}: not enough data to compute even one frame after padding.")
+            continue
 
+        padded_batch.append(sample)
+
+    if not padded_batch:
+        print("❌ All samples were too short — returning empty embedding tensor.")
+        return torch.zeros(x.shape[0], 128).to(x.device)
+
+    try:
         examples_batch = _vggish_input_module.waveform_to_examples(np.array(padded_batch), SAMPLE_RATE)
-        examples_batch = torch.from_numpy(examples_batch).to(x.device)
+    except Exception as e:
+        print(f"❌ Failed in waveform_to_examples: {e}")
+        return torch.zeros(x.shape[0], 128).to(x.device)
 
-        embeddings = self.vggish.forward(examples_batch)
-        pooled_embeddings = torch.mean(embeddings, dim=1)
-        return pooled_embeddings
+    examples_batch = torch.from_numpy(examples_batch).to(x.device)
+    embeddings = self.vggish.forward(examples_batch)
+    pooled_embeddings = torch.mean(embeddings, dim=1)
+    return pooled_embeddings
+
 
 
 class TransferLearningCNN(nn.Module):
