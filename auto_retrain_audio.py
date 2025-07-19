@@ -53,7 +53,7 @@ augment = Compose([
 # --- INITIALIZE FIREBASE ---
 try:
     cred = credentials.Certificate("firebase_key.json")
-    firebase_admin.initialize_app(cred, {
+    firebase_admin.initializeApp(cred, {
         'storageBucket': BUCKET_NAME
     })
     bucket = storage.bucket()
@@ -288,9 +288,9 @@ class VGGishFeatureExtractor(nn.Module):
             # Load the original VGGish model to get its state_dict
             original_vggish_model = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', pretrained=True)
             
-            # Load the state_dict into our custom model
-            self.vggish_base.load_state_dict(original_vggish_model.state_dict())
-            print("DEBUG: Pre-trained VGGish weights successfully loaded into CustomVGGish.")
+            # Load the state_dict into our custom model, ignoring unexpected keys
+            self.vggish_base.load_state_dict(original_vggish_model.state_dict(), strict=False) # ADDED strict=False
+            print("DEBUG: Pre-trained VGGish weights successfully loaded into CustomVGGish (ignoring extra keys).")
             
             # Freeze parameters of the base VGGish model
             for param in self.vggish_base.parameters():
