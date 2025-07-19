@@ -20,6 +20,8 @@ import torch.hub
 
 # Placeholder for the vggish_input module, will be loaded dynamically
 _vggish_input_module = None
+# Placeholder for vggish_params module, will be loaded dynamically for pre-validation
+_vggish_params_module = None
 # --- END NEW ---
 
 # --- CONFIGURATION ---
@@ -254,26 +256,43 @@ def main():
     valid_audio_labels = []
     target_length_samples = SAMPLE_RATE * DURATION
 
+    # --- NEW: Temporarily load vggish_params for pre-validation ---
+    global _vggish_params_module
+    if _vggish_params_module is None:
+        vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
+        torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
+        if torchvggish_path not in sys.path:
+            sys.path.insert(0, torchvggish_path)
+        try:
+            from torchvggish import vggish_params as imported_vggish_params
+            _vggish_params_module = imported_vggish_params
+        except ImportError as e:
+            print(f"Warning: Could not import vggish_params for pre-validation. Skipping VGGish-specific length check. Error: {e}")
+            # Set a default minimal length if vggish_params cannot be loaded
+            min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds
+    
+    # Use the loaded module or fallback default
+    if _vggish_params_module is not None:
+        min_vggish_input_samples = int(_vggish_params_module.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
+    else:
+        min_vggish_input_samples = SAMPLE_RATE * 0.1 # Fallback to 0.1 seconds if module not loaded
+    # --- END NEW ---
+
+
     print("Pre-validating audio files...")
     for i, path in enumerate(all_audio_paths):
         try:
             # Attempt to read and resample to ensure it's a valid audio file
             wav_check, sr_check = sf.read(path)
-            if wav_check.size == 0:
+            if wav_check is None or wav_check.size == 0: # Check for None or empty array
                 print(f"Skipping empty audio file: {path}")
                 continue
             
             resampled_wav_check = librosa.resample(wav_check, orig_sr=sr_check, target_sr=SAMPLE_RATE)
             
-            # Check if the resampled audio is still too short or problematic for VGGish's internal framing
-            # VGGish's internal frame size is vggish_params.STFT_WINDOW_LENGTH_SECONDS * vggish_params.SAMPLE_RATE
-            # which is 0.025 * 16000 = 400 samples.
-            # A minimum length is required to form even one frame.
-            # Let's assume a minimum of at least one frame length for robust processing.
-            min_vggish_input_samples = int(vggish_params.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE) # 400 samples
-
+            # Check if the resampled audio is still too short for VGGish's internal framing
             if len(resampled_wav_check) < min_vggish_input_samples:
-                print(f"Skipping audio file too short for VGGish framing ({len(resampled_wav_check)} samples): {path}")
+                print(f"Skipping audio file too short for VGGish framing ({len(resampled_wav_check)} samples, min needed {min_vggish_input_samples}): {path}")
                 continue
 
             # If it passes these checks, it's considered valid for inclusion
@@ -320,9 +339,16 @@ def main():
 
     # Custom collate_fn (simplified as __getitem__ always returns valid data)
     def custom_collate_fn(batch):
-        # Batch is guaranteed to have valid items from VoiceDataset
-        audios = torch.stack([item[0] for item in batch])
-        labels = torch.tensor([item[1] for item in batch])
+        # Filter out any samples that were returned as dummy data (label -1) from VoiceDataset
+        # This is a safeguard if __getitem__ failed to process a file even after pre-validation.
+        filtered_batch = [item for item in batch if item[1] != -1]
+        
+        if not filtered_batch:
+            # Return empty tensors of correct shape if batch is empty, to avoid DataLoader crash
+            return torch.empty(0, SAMPLE_RATE * DURATION).float(), torch.empty(0, dtype=torch.long)
+        
+        audios = torch.stack([item[0] for item in filtered_batch])
+        labels = torch.tensor([item[1] for item in filtered_batch])
         return audios, labels
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn)
@@ -342,7 +368,7 @@ def main():
         model.train()
         total_loss = 0
         for batch_idx, (x, y) in enumerate(train_loader):
-            # Skip empty batches from custom_collate_fn if any
+            # Skip empty batches from custom_collate_fn
             if x.numel() == 0: # Check if tensor is empty
                 print(f"  Skipping empty batch {batch_idx+1} in training (no valid samples).")
                 continue
@@ -364,7 +390,7 @@ def main():
         correct = total = 0
         with torch.no_grad():
             for batch_idx_val, (x, y) in enumerate(val_loader): # Added batch_idx_val for clarity
-                # Skip empty batches from custom_collate_fn if any
+                # Skip empty batches from custom_collate_fn
                 if x.numel() == 0: # Check if tensor is empty
                     print(f"  Skipping empty batch {batch_idx_val+1} in validation (no valid samples).")
                     continue
