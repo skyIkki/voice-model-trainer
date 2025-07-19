@@ -152,69 +152,54 @@ class VoiceDataset(Dataset):
 class VGGishFeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
-        # Load pre-trained VGGish model from PyTorch Hub
         self.vggish = torch.hub.load('harritaylor/pytorch-vggish', 'vggish')
-
-        # Ensure _vggish_input_module is loaded (it should be by _ensure_vggish_modules_loaded in main)
         global _vggish_input_module, _vggish_params_module
         if _vggish_input_module is None:
             vggish_repo_path = os.path.join(torch.hub.get_dir(), 'harritaylor_pytorch-vggish_master')
             torchvggish_path = os.path.join(vggish_repo_path, 'torchvggish')
             if torchvggish_path not in sys.path:
                 sys.path.insert(0, torchvggish_path)
-            try:
-                from torchvggish import vggish_input as imported_vggish_input
-                _vggish_input_module = imported_vggish_input
-            except ImportError as e:
-                raise ImportError(f"Failed to import vggish_input as fallback. Error: {e}")
+            from torchvggish import vggish_input as imported_vggish_input
+            _vggish_input_module = imported_vggish_input
 
         if _vggish_params_module is None:
-            try:
-                from torchvggish import vggish_params as imported_vggish_params
-                _vggish_params_module = imported_vggish_params
-            except ImportError as e:
-                raise ImportError(f"Failed to import vggish_params. Error: {e}")
+            from torchvggish import vggish_params as imported_vggish_params
+            _vggish_params_module = imported_vggish_params
 
-        # Set VGGish to evaluation mode (important for consistent feature extraction)
         self.vggish.eval()
-
-        # Freeze VGGish parameters to use it as a fixed feature extractor
         for param in self.vggish.parameters():
             param.requires_grad = False
 
     def forward(self, x):
-        # x is [batch_size, num_samples]
         if _vggish_input_module is None:
-            raise RuntimeError("vggish_input_module was not successfully loaded.")
-
+            raise RuntimeError("vggish_input_module not loaded")
         if x.numel() == 0:
             return torch.zeros(x.shape[0], 128).to(x.device)
 
-        # Convert to numpy
         batch_numpy = x.cpu().contiguous().numpy()
 
-        # Minimum required length for VGGish framing
-        required_samples = int(_vggish_params_module.STFT_WINDOW_LENGTH_SECONDS * SAMPLE_RATE)
+        # VGGish STFT constants
+        window_length = int(SAMPLE_RATE * _vggish_params_module.STFT_WINDOW_LENGTH_SECONDS)  # 0.025s * 16k = 400
+        hop_length = int(SAMPLE_RATE * _vggish_params_module.STFT_HOP_LENGTH_SECONDS)        # 0.010s * 16k = 160
+        min_num_frames = 1  # you can raise this to 2 or 3 if needed
 
-        # Pad short samples
+        min_required_samples = window_length + (min_num_frames - 1) * hop_length  # at least 1 frame
+
         padded_batch = []
         for sample in batch_numpy:
-            if sample.shape[0] < required_samples:
-                pad_length = required_samples - sample.shape[0]
-                print(f"⚠️ Sample too short for VGGish framing. Padding from {sample.shape[0]} to {required_samples}")
-                sample = np.pad(sample, (0, pad_length), mode='constant')
+            if sample.shape[0] < min_required_samples:
+                pad_len = min_required_samples - sample.shape[0]
+                print(f"⚠️ Padding sample from {sample.shape[0]} to {min_required_samples}")
+                sample = np.pad(sample, (0, pad_len), mode='constant')
             padded_batch.append(sample)
 
-        # Convert to VGGish-compatible input
         examples_batch = _vggish_input_module.waveform_to_examples(np.array(padded_batch), SAMPLE_RATE)
         examples_batch = torch.from_numpy(examples_batch).to(x.device)
 
-        # Pass through VGGish
         embeddings = self.vggish.forward(examples_batch)
-
-        # Average pool the embeddings across time
-        pooled_embeddings = torch.mean(embeddings, dim=1)  # Output: [batch_size, 128]
+        pooled_embeddings = torch.mean(embeddings, dim=1)
         return pooled_embeddings
+
 
 class TransferLearningCNN(nn.Module):
     def __init__(self, num_classes):
