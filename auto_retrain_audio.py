@@ -53,7 +53,8 @@ augment = Compose([
 # --- INITIALIZE FIREBASE ---
 try:
     cred = credentials.Certificate("firebase_key.json")
-    firebase_admin.initializeApp(cred, {
+    # Corrected: initializeApp -> initialize_app
+    firebase_admin.initialize_app(cred, {
         'storageBucket': BUCKET_NAME
     })
     bucket = storage.bucket()
