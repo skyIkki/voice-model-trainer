@@ -258,13 +258,11 @@ class VGGishFeatureExtractor(nn.Module):
             else:
                 examples_batch_np = temp_examples_batch # Already a NumPy array
 
-            # --- NEW: Squeeze out the problematic dimension if it exists and is 1 ---
-            # This is the crucial fix for the (X, 1, 96, 64) -> (X, 96, 64) problem
+            # Squeeze out the problematic dimension if it exists and is 1
             if examples_batch_np.ndim == 4 and examples_batch_np.shape[1] == 1:
                 print(f"DEBUG: Squeezing problematic dimension from examples_batch_np. Shape before: {examples_batch_np.shape}")
                 examples_batch_np = np.squeeze(examples_batch_np, axis=1)
                 print(f"DEBUG: Shape after squeezing: {examples_batch_np.shape}")
-            # --- END NEW ---
 
             # Debugging prints for examples_batch_np
             print(f"DEBUG: examples_batch_np shape after conversion and squeeze: {examples_batch_np.shape}")
@@ -299,35 +297,33 @@ class VGGishFeatureExtractor(nn.Module):
             embeddings = self.vggish.forward(examples_batch) # Expected output: (total_num_segments, 128)
             print(f"DEBUG: Embeddings shape after self.vggish.forward: {embeddings.shape}")
 
-            # Now, reshape and average pool per original audio clip
-            # Calculate num_segments_per_audio based on the VGGish parameters for EXAMPLE_WINDOW_SECONDS and EXAMPLE_HOP_SECONDS
-            # For a 3-second audio, with 0.96s window and 0.96s hop, this should be 3 segments.
-            # We must ensure this calculation is robust.
-            if vggish_params is not None:
-                num_segments_per_audio = int((DURATION - vggish_params.EXAMPLE_WINDOW_SECONDS) / vggish_params.EXAMPLE_HOP_SECONDS) + 1
-                if num_segments_per_audio <= 0:
-                    num_segments_per_audio = 1 # Ensure at least one segment
+            # --- NEW: Robust calculation of num_segments_per_audio ---
+            # Calculate num_segments_per_audio based on the actual output of vggish.forward
+            # This is the most robust way to handle variable segment counts per audio.
+            if x.shape[0] > 0: # Avoid division by zero if batch is empty
+                num_segments_per_audio = embeddings.shape[0] // x.shape[0]
             else:
-                # Fallback if vggish_params is not loaded (should not happen with global import)
-                num_segments_per_audio = int((DURATION - 0.96) / 0.96) + 1 # Use default VGGish example params
-                if num_segments_per_audio <= 0:
-                    num_segments_per_audio = 1
+                num_segments_per_audio = 1 # Fallback for empty batch, though handled earlier
 
-            # Ensure the total number of segments matches what VGGish actually produced
-            expected_total_segments = x.shape[0] * num_segments_per_audio
-            if embeddings.shape[0] != expected_total_segments:
-                print(f"WARNING: Mismatch in total segments. Expected {expected_total_segments}, got {embeddings.shape[0]}. Adjusting num_segments_per_audio dynamically.")
-                # Dynamically adjust num_segments_per_audio if there's a mismatch
-                # This handles cases where waveform_to_examples might produce a different number of segments
-                # (e.g., due to floating point inaccuracies or very short audio).
-                if x.shape[0] > 0: # Avoid division by zero
-                    num_segments_per_audio = embeddings.shape[0] // x.shape[0]
-                if num_segments_per_audio == 0: # Fallback to 1 if calculation results in 0
-                    num_segments_per_audio = 1
+            if num_segments_per_audio == 0: # Ensure it's never zero
+                num_segments_per_audio = 1
+            
+            print(f"DEBUG: Dynamically calculated num_segments_per_audio: {num_segments_per_audio}")
+            print(f"DEBUG: Expected total elements for reshape (batch_size * num_segments_per_audio * 128): {x.shape[0] * num_segments_per_audio * 128}")
+            print(f"DEBUG: Actual embeddings.numel(): {embeddings.numel()}")
+            # --- END NEW ---
 
             # Reshape embeddings to (batch_size, num_segments_per_audio, 128)
-            reshaped_embeddings = embeddings.view(x.shape[0], num_segments_per_audio, 128)
-            print(f"DEBUG: Reshaped embeddings shape: {reshaped_embeddings.shape}")
+            # This is where the error must be originating if embeddings is not (total_num_segments, 128)
+            # or if the calculated num_segments_per_audio is wrong.
+            try:
+                reshaped_embeddings = embeddings.view(x.shape[0], num_segments_per_audio, 128)
+                print(f"DEBUG: Reshaped embeddings shape: {reshaped_embeddings.shape}")
+            except RuntimeError as e:
+                print(f"❌ CRITICAL ERROR: RuntimeError during reshape of embeddings: {e}")
+                print(f"   Attempting to reshape embeddings.shape={embeddings.shape} to ({x.shape[0]}, {num_segments_per_audio}, 128)")
+                # Fallback to zero-filled if reshape fails
+                return torch.zeros(x.shape[0], 128).to(x.device)
 
             # Average pool the embeddings across the time segments (dim=1)
             pooled_embeddings = torch.mean(reshaped_embeddings, dim=1) # Output shape: [batch_size, 128]
@@ -358,7 +354,9 @@ class TransferLearningCNN(nn.Module):
     def forward(self, x):
         # Pass the raw audio through the VGGish feature extractor
         features = self.feature_extractor(x) # Output: [batch_size, 128]
-
+        # --- NEW: Debugging print for features before classifier ---
+        print(f"DEBUG: Features shape before classifier: {features.shape}")
+        # --- END NEW ---
         # Pass the extracted features through the new classification head
         output = self.classifier(features)
         return output
