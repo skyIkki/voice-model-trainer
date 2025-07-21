@@ -19,8 +19,8 @@ import sys # Import sys for path manipulation
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
 DOWNLOAD_DIR = "user_training_data"
 # Define the upload path for the trained model and class map
-MODEL_UPLOAD_PATH = "best_voice_model.pt" # Changed to upload to root
-CLASS_MAP_UPLOAD_PATH = "class_to_label.json" # Changed to upload to root
+MODEL_UPLOAD_PATH = "best_voice_model_scripted.pt" # Changed filename for TorchScript model
+CLASS_MAP_UPLOAD_PATH = "class_to_label.json" # Upload to root
 
 SAMPLE_RATE = 16000
 DURATION = 3  # seconds
@@ -55,8 +55,6 @@ augment = Compose([
 ])
 
 # --- INITIALIZE FIREBASE ---
-# Note: In a real GitHub Actions environment, 'firebase_key.json' is created by the workflow.
-# For local testing, ensure firebase_key.json is present or mock firebase_admin.
 try:
     cred = credentials.Certificate("firebase_key.json")
     firebase_admin.initialize_app(cred, {
@@ -296,7 +294,7 @@ class VGGishFeatureExtractor(nn.Module):
             original_vggish_model = torch.hub.load('harritaylor/pytorch-vggish', 'vggish', pretrained=True)
             
             # Load the state_dict into our custom model, ignoring unexpected keys
-            self.vggish_base.load_state_dict(original_vggish_model.state_dict(), strict=False) # ADDED strict=False
+            self.vggish_base.load_state_dict(original_vggish_model.state_dict(), strict=False)
             print("DEBUG: Pre-trained VGGish weights successfully loaded into CustomVGGish (ignoring extra keys).")
             
             # Freeze parameters of the base VGGish model
@@ -528,18 +526,38 @@ def main():
 
         if acc > best_val_acc:
             best_val_acc = acc
-            torch.save(model.state_dict(), "best_voice_model.pt")
-            print("✅ Model saved (best) locally.")
+            # Save only the state_dict during training for checkpointing
+            torch.save(model.state_dict(), "best_voice_model_temp.pt")
+            print("✅ Model state_dict saved (best) locally.")
 
     print("🎉 Training complete")
 
-    # --- NEW: Upload trained model and class map to Firebase Storage ---
+    # --- NEW: Export and Upload TorchScript model and class map to Firebase Storage ---
     if bucket is not None:
         try:
-            # Upload model file
+            # Load the best state_dict back into the model
+            model.load_state_dict(torch.load("best_voice_model_temp.pt"))
+            model.eval() # Set to eval mode for tracing
+
+            # Create a dummy input for tracing
+            # The input to the model's forward method is raw audio: (batch_size, SAMPLE_RATE * DURATION)
+            dummy_input = torch.randn(1, SAMPLE_RATE * DURATION).to(DEVICE)
+            
+            # Trace the model
+            print("Attempting to trace the model for TorchScript export...")
+            # The traced model will include the VGGishFeatureExtractor and the classifier
+            traced_model = torch.jit.trace(model, dummy_input)
+            print("✅ Model successfully traced.")
+
+            # Save the traced model
+            traced_model_filename = "best_voice_model_scripted.pt"
+            torch.jit.save(traced_model, traced_model_filename)
+            print(f"✅ TorchScript model saved locally as {traced_model_filename}")
+
+            # Upload TorchScript model file
             model_blob = bucket.blob(MODEL_UPLOAD_PATH)
-            model_blob.upload_from_filename("best_voice_model.pt")
-            print(f"✅ Uploaded best_voice_model.pt to gs://{BUCKET_NAME}/{MODEL_UPLOAD_PATH}")
+            model_blob.upload_from_filename(traced_model_filename)
+            print(f"✅ Uploaded {traced_model_filename} to gs://{BUCKET_NAME}/{MODEL_UPLOAD_PATH}")
 
             # Upload class map file
             class_map_blob = bucket.blob(CLASS_MAP_UPLOAD_PATH)
@@ -547,9 +565,14 @@ def main():
             print(f"✅ Uploaded class_to_label.json to gs://{BUCKET_NAME}/{CLASS_MAP_UPLOAD_PATH}")
 
         except Exception as e:
-            print(f"❌ ERROR: Failed to upload model or class map to Firebase Storage: {e}")
+            print(f"❌ ERROR: Failed to export or upload model/class map to Firebase Storage: {e}")
     else:
         print("⚠️ Firebase bucket not available for upload. Model and class map not uploaded.")
+    
+    # Clean up temporary model file
+    if os.path.exists("best_voice_model_temp.pt"):
+        os.remove("best_voice_model_temp.pt")
+        print("Cleaned up temporary model file: best_voice_model_temp.pt")
     # --- END NEW ---
 
 if __name__ == "__main__":
