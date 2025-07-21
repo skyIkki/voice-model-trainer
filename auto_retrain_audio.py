@@ -19,8 +19,8 @@ import sys # Import sys for path manipulation
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
 DOWNLOAD_DIR = "user_training_data"
 # Define the upload path for the trained model and class map
-MODEL_UPLOAD_PATH = "trained_models/latest/best_voice_model.pt"
-CLASS_MAP_UPLOAD_PATH = "trained_models/latest/class_to_label.json"
+MODEL_UPLOAD_PATH = "best_voice_model.pt" # Changed to upload to root
+CLASS_MAP_UPLOAD_PATH = "class_to_label.json" # Changed to upload to root
 
 SAMPLE_RATE = 16000
 DURATION = 3  # seconds
