@@ -18,6 +18,10 @@ import sys # Import sys for path manipulation
 # --- CONFIGURATION ---
 BUCKET_NAME = "voice-model-trainer-b6814.firebasestorage.app"
 DOWNLOAD_DIR = "user_training_data"
+# Define the upload path for the trained model and class map
+MODEL_UPLOAD_PATH = "trained_models/latest/best_voice_model.pt"
+CLASS_MAP_UPLOAD_PATH = "trained_models/latest/class_to_label.json"
+
 SAMPLE_RATE = 16000
 DURATION = 3  # seconds
 NUM_CLASSES = 0 # Will be set dynamically
@@ -51,9 +55,10 @@ augment = Compose([
 ])
 
 # --- INITIALIZE FIREBASE ---
+# Note: In a real GitHub Actions environment, 'firebase_key.json' is created by the workflow.
+# For local testing, ensure firebase_key.json is present or mock firebase_admin.
 try:
     cred = credentials.Certificate("firebase_key.json")
-    # Corrected: initializeApp -> initialize_app
     firebase_admin.initialize_app(cred, {
         'storageBucket': BUCKET_NAME
     })
@@ -62,6 +67,7 @@ except ValueError:
     print("Firebase app already initialized or firebase_key.json not found. Skipping initialization.")
 except FileNotFoundError:
     print("firebase_key.json not found. Ensure it's in the root directory for local testing.")
+    bucket = None # Set bucket to None if initialization fails
 
 def download_training_data():
     try:
@@ -74,7 +80,7 @@ def download_training_data():
         print("Shutil not available, skipping directory cleanup. Ensure directory is empty.")
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    if 'bucket' not in globals() or bucket is None:
+    if bucket is None: # Check if bucket was successfully initialized
         print("Firebase bucket not initialized. Skipping data download.")
         return
 
@@ -442,6 +448,7 @@ def main():
     NUM_CLASSES = len(label_encoder.classes_)
     print(f"Found {len(valid_audio_paths)} valid audio files across {NUM_CLASSES} classes.")
 
+    # Save class map locally
     with open("class_to_label.json", "w") as f:
         json.dump({str(i): label for i, label in enumerate(label_encoder.classes_)}, f)
     print("Class map saved to class_to_label.json")
@@ -522,9 +529,28 @@ def main():
         if acc > best_val_acc:
             best_val_acc = acc
             torch.save(model.state_dict(), "best_voice_model.pt")
-            print("✅ Model saved (best)")
+            print("✅ Model saved (best) locally.")
 
     print("🎉 Training complete")
+
+    # --- NEW: Upload trained model and class map to Firebase Storage ---
+    if bucket is not None:
+        try:
+            # Upload model file
+            model_blob = bucket.blob(MODEL_UPLOAD_PATH)
+            model_blob.upload_from_filename("best_voice_model.pt")
+            print(f"✅ Uploaded best_voice_model.pt to gs://{BUCKET_NAME}/{MODEL_UPLOAD_PATH}")
+
+            # Upload class map file
+            class_map_blob = bucket.blob(CLASS_MAP_UPLOAD_PATH)
+            class_map_blob.upload_from_filename("class_to_label.json")
+            print(f"✅ Uploaded class_to_label.json to gs://{BUCKET_NAME}/{CLASS_MAP_UPLOAD_PATH}")
+
+        except Exception as e:
+            print(f"❌ ERROR: Failed to upload model or class map to Firebase Storage: {e}")
+    else:
+        print("⚠️ Firebase bucket not available for upload. Model and class map not uploaded.")
+    # --- END NEW ---
 
 if __name__ == "__main__":
     import shutil
